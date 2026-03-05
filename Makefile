@@ -65,6 +65,14 @@ typecheck-web:
 clean-web:
 	rm -rf web/dist web/.output web/.nitro web/.tanstack web/node_modules
 
+# --- Manual Testing ---
+
+manual-test:
+	./scripts/manual-test.sh
+
+manual-test-live:
+	./scripts/manual-test.sh --live --keep
+
 # --- Setup ---
 
 setup:

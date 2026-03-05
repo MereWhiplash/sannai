@@ -49,22 +49,40 @@ impl SessionManager {
         mut rx: mpsc::Receiver<WatcherEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(60));
+        tracing::info!("Session manager started");
+        let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(200));
+        let mut idle_interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
                     tracing::info!("Session manager shutting down");
-                    // End all active sessions
                     self.end_all_sessions().await;
                     break;
                 }
-                Some(event) = rx.recv() => {
-                    if let Err(e) = self.process_event(event).await {
-                        tracing::warn!("Failed to process event: {}", e);
+                _ = poll_interval.tick() => {
+                    // Drain all available events from the channel.
+                    // We poll instead of using rx.recv().await because the watcher
+                    // sends events from a blocking thread, which may not wake the
+                    // async receiver.
+                    loop {
+                        match rx.try_recv() {
+                            Ok(event) => {
+                                if let Err(e) = self.process_event(event).await {
+                                    tracing::warn!("Failed to process event: {}", e);
+                                }
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                tracing::info!("Watcher channel disconnected");
+                                self.end_all_sessions().await;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
-                _ = idle_check.tick() => {
+                _ = idle_interval.tick() => {
                     if let Err(e) = self.check_idle_sessions().await {
                         tracing::warn!("Failed to check idle sessions: {}", e);
                     }

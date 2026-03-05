@@ -302,6 +302,13 @@ impl FileWatcher {
         let file = File::open(&tailed.path)?;
         let file_len = file.metadata()?.len();
 
+        tracing::debug!(
+            "Tailing {} (offset={}, file_len={})",
+            tailed.path.display(),
+            tailed.offset,
+            file_len
+        );
+
         if file_len <= tailed.offset {
             return Ok(());
         }
@@ -311,6 +318,8 @@ impl FileWatcher {
 
         let mut bytes_read = tailed.offset;
         let mut line_buf = String::new();
+        let mut lines_parsed = 0u64;
+        let mut events_sent = 0u64;
 
         loop {
             line_buf.clear();
@@ -325,6 +334,7 @@ impl FileWatcher {
                 continue;
             }
 
+            lines_parsed += 1;
             match parser::parse_line(line) {
                 Ok(parsed_events) => {
                     for parsed in parsed_events {
@@ -351,6 +361,8 @@ impl FileWatcher {
                         // Use try_send to avoid blocking; if channel is full, log and skip
                         if let Err(e) = self.tx.try_send(event) {
                             tracing::warn!("Failed to send watcher event: {}", e);
+                        } else {
+                            events_sent += 1;
                         }
                     }
                 }
@@ -364,6 +376,12 @@ impl FileWatcher {
             }
         }
 
+        tracing::debug!(
+            "Tailed {}: {} lines parsed, {} events sent",
+            tailed.path.display(),
+            lines_parsed,
+            events_sent
+        );
         tailed.offset = bytes_read;
         Ok(())
     }

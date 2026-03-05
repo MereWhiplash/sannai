@@ -6,7 +6,11 @@ use std::path::PathBuf;
 /// Data directory for the store DB and watcher state.
 /// macOS: ~/Library/Application Support/dev.sannai.sannai-agent/
 /// Linux: ~/.local/share/sannai-agent/
+/// Override with SANNAI_DATA_DIR for testing.
 pub fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SANNAI_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     ProjectDirs::from("dev", "sannai", "sannai-agent")
         .map(|dirs| dirs.data_dir().to_path_buf())
         .unwrap_or_else(|| {
@@ -18,7 +22,11 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Claude Code projects directory.
+/// Override with SANNAI_CLAUDE_DIR for testing.
 pub fn claude_projects_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SANNAI_CLAUDE_DIR") {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var("HOME")
         .map(PathBuf::from)
         .expect("Could not determine home directory");
