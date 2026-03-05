@@ -1,0 +1,35 @@
+[package]
+name = "sannai-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Local daemon for AI coding session capture"
+license = "MIT"
+
+[[bin]]
+name = "sannai"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+notify = "6"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+git2 = "0.18"
+reqwest = { version = "0.12", features = ["json"] }
+directories = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.7"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

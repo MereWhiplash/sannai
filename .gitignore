@@ -1,0 +1,48 @@
+# =========================
+# Sannai Monorepo .gitignore
+# =========================
+
+# --- Rust (agent/) ---
+agent/target/
+**/*.rs.bk
+
+# --- Go (api/) ---
+api/bin/
+api/vendor/
+
+# --- Node/React (web/) ---
+web/node_modules/
+web/dist/
+web/.output/
+web/.nitro/
+web/.tanstack/
+web/src/routeTree.gen.ts
+web/.next/
+web/.turbo/
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Environment ---
+.env
+.env.local
+.env.*.local
+
+# --- Build artifacts ---
+*.log
+*.pid
+*.seed
+
+# --- Testing ---
+coverage/
+*.coverprofile
+*.lcov
+
+# --- OS ---
+Thumbs.db
+ehthumbs.db
