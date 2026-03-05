@@ -124,7 +124,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     // 5. Watcher -> Session Manager channel
-    let (tx, rx) = mpsc::channel::<watcher::WatcherEvent>(1000);
+    let (tx, rx) = mpsc::channel::<watcher::WatcherEvent>(100_000);
 
     // 6. Session Manager
     let session_mgr = Arc::new(Mutex::new(session::SessionManager::new(
