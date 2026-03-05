@@ -13,14 +13,18 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@tanstack/react-form": "^1.28.4",
+    "@tanstack/react-query": "^5.90.21",
+    "@tanstack/react-query-devtools": "^5.91.3",
     "@tanstack/react-router": "^1.166.2",
     "@tanstack/react-router-devtools": "^1.166.2",
     "@tanstack/react-start": "^1.166.2",
+    "@tanstack/react-table": "^8.21.3",
+    "@tanstack/zod-form-adapter": "^0.42.1",
+    "date-fns": "^3.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^2.12.0",
-    "date-fns": "^3.3.0",
-    "zustand": "^4.5.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
@@ -28,14 +32,14 @@
     "@types/node": "^22.5.4",
     "@types/react": "^19.0.8",
     "@types/react-dom": "^19.0.3",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
     "@vitejs/plugin-react": "^4.6.0",
+    "eslint": "^9.0.0",
     "nitro": "3.0.1-alpha.2",
     "tailwindcss": "^4.1.18",
     "typescript": "^5.7.2",
     "vite": "^7.3.1",
-    "vite-tsconfig-paths": "^5.1.4",
-    "eslint": "^9.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "@typescript-eslint/parser": "^8.0.0"
+    "vite-tsconfig-paths": "^5.1.4"
   }
 }

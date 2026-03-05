@@ -125,6 +125,9 @@ impl FileWatcher {
 
         // Bridge sync notify events to our async loop
         let cancel_clone = cancel.clone();
+        let mut last_poll = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_secs(1);
+
         loop {
             if cancel_clone.is_cancelled() {
                 break;
@@ -151,6 +154,18 @@ impl FileWatcher {
                     tracing::error!("File watcher channel disconnected");
                     break;
                 }
+            }
+
+            // Periodically re-tail all tracked files to catch any missed notify events
+            // (macOS FSEvents can coalesce or miss rapid appends)
+            if last_poll.elapsed() >= poll_interval && !self.tailed_files.is_empty() {
+                let paths: Vec<PathBuf> = self.tailed_files.keys().cloned().collect();
+                for path in paths {
+                    if let Err(e) = self.tail_file(&path) {
+                        tracing::warn!("Failed to poll-tail {}: {}", path.display(), e);
+                    }
+                }
+                last_poll = std::time::Instant::now();
             }
         }
 

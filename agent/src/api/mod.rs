@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::CorsLayer;
 
 use crate::session::SessionManager;
 use crate::store::{self, Store};
@@ -32,8 +33,9 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/hook/commit", post(hook_commit))
         .route("/sessions", get(list_sessions))
-        .route("/sessions/{id}", get(get_session))
-        .route("/sessions/{id}/events", get(get_session_events))
+        .route("/sessions/:id", get(get_session))
+        .route("/sessions/:id/events", get(get_session_events))
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 

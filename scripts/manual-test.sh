@@ -130,14 +130,26 @@ fi
 SESSION_ID=$(echo "$SESSIONS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['id'] if d else '')" 2>/dev/null || echo "")
 if [[ -n "$SESSION_ID" ]]; then
   echo "--- Session detail: $SESSION_ID ---"
-  DETAIL=$(curl -s "http://127.0.0.1:9847/sessions/$SESSION_ID")
-  echo "$DETAIL" | python3 -m json.tool 2>/dev/null || echo "$DETAIL"
+  HTTP_CODE=$(curl -s -o /tmp/sannai-detail.json -w '%{http_code}' "http://127.0.0.1:9847/sessions/$SESSION_ID")
+  DETAIL=$(cat /tmp/sannai-detail.json)
+  if [[ "$HTTP_CODE" != "200" ]]; then
+    echo "  ERROR: GET /sessions/$SESSION_ID returned HTTP $HTTP_CODE"
+    [[ -n "$DETAIL" ]] && echo "  Body: $DETAIL"
+  else
+    echo "$DETAIL" | python3 -m json.tool 2>/dev/null || echo "$DETAIL"
+  fi
   echo ""
 
   echo "--- Events (first 5) ---"
-  EVENTS=$(curl -s "http://127.0.0.1:9847/sessions/$SESSION_ID/events")
-  EVENT_COUNT=$(echo "$EVENTS" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
-  echo "$EVENTS" | python3 -c '
+  HTTP_CODE=$(curl -s -o /tmp/sannai-events.json -w '%{http_code}' "http://127.0.0.1:9847/sessions/$SESSION_ID/events")
+  EVENTS=$(cat /tmp/sannai-events.json)
+  if [[ "$HTTP_CODE" != "200" ]]; then
+    echo "  ERROR: GET /sessions/$SESSION_ID/events returned HTTP $HTTP_CODE"
+    [[ -n "$EVENTS" ]] && echo "  Body: $EVENTS"
+    EVENT_COUNT="?"
+  else
+    EVENT_COUNT=$(echo "$EVENTS" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+    echo "$EVENTS" | python3 -c '
 import sys, json
 events = json.load(sys.stdin)
 for e in events[:5]:
@@ -147,6 +159,7 @@ for e in events[:5]:
     print(f"  [{etype:18s}] {ts}  {content}")
 print(f"  ... {len(events)} total events")
 ' 2>/dev/null || echo "  ($EVENT_COUNT events)"
+  fi
   echo ""
 fi
 
