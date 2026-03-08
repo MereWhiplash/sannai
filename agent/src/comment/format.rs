@@ -116,10 +116,11 @@ fn truncate_for_table(text: &str, max_len: usize) -> String {
     let first_line = text.lines().next().unwrap_or("");
     // Escape pipes and newlines for markdown table cells
     let clean = first_line.replace('|', "\\|");
-    if clean.len() <= max_len {
+    if clean.chars().count() <= max_len {
         clean
     } else {
-        format!("{}...", &clean[..max_len])
+        let truncated: String = clean.chars().take(max_len).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -250,6 +251,15 @@ mod tests {
         let long = "a".repeat(100);
         let truncated = truncate_for_table(&long, 60);
         assert!(truncated.ends_with("..."));
-        assert!(truncated.len() <= 64); // 60 + "..."
+        assert!(truncated.chars().count() <= 63); // 60 + "..."
+    }
+
+    #[test]
+    fn test_truncate_for_table_multibyte_utf8() {
+        // Should not panic on multi-byte characters
+        let text = "\u{1f600}".repeat(100); // 100 emoji
+        let truncated = truncate_for_table(&text, 10);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.chars().count() <= 13); // 10 + "..."
     }
 }

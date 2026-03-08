@@ -3,6 +3,7 @@ pub enum DetectedGitOp {
     Commit { amend: bool, message: Option<String> },
     Push { force: bool },
     Checkout { branch: Option<String> },
+    Merge,
     Rebase,
     Stash { pop: bool },
     Reset { hard: bool },
@@ -47,7 +48,7 @@ pub fn detect_git_command(input: &str) -> Option<DetectedGitOp> {
             let hard = parts.contains(&"--hard");
             Some(DetectedGitOp::Reset { hard })
         }
-        "merge" => Some(DetectedGitOp::Rebase), // treat merge like rebase for detection
+        "merge" => Some(DetectedGitOp::Merge),
         // Read-only commands — ignore
         "status" | "log" | "diff" | "show" | "branch" | "remote" | "fetch" | "ls-files"
         | "rev-parse" | "describe" | "tag" | "blame" | "shortlog" | "reflog" => None,
@@ -63,7 +64,7 @@ fn extract_message_flag(parts: &[&str]) -> Option<String> {
                 // Reconstruct message from remaining parts until we hit another flag
                 let mut message_parts = vec![msg];
                 for &p in parts.iter().skip(i + 2) {
-                    if p.starts_with('-') && !p.starts_with('-') {
+                    if p.starts_with('-') {
                         break;
                     }
                     message_parts.push(p);
@@ -128,11 +129,27 @@ mod tests {
             detect_git_command("git reset --hard HEAD~1"),
             Some(DetectedGitOp::Reset { hard: true })
         );
+        assert_eq!(
+            detect_git_command("git merge feature-branch"),
+            Some(DetectedGitOp::Merge)
+        );
         // Not a git command
         assert_eq!(detect_git_command("cargo build"), None);
         // Git read-only commands should be ignored
         assert_eq!(detect_git_command("git status"), None);
         assert_eq!(detect_git_command("git log"), None);
         assert_eq!(detect_git_command("git diff"), None);
+    }
+
+    #[test]
+    fn test_extract_message_stops_at_flag() {
+        // Message extraction should stop at subsequent flags
+        assert_eq!(
+            detect_git_command("git commit -m 'initial' --no-verify"),
+            Some(DetectedGitOp::Commit {
+                amend: false,
+                message: Some("initial".into())
+            })
+        );
     }
 }

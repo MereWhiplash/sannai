@@ -305,15 +305,12 @@ mod tests {
         GitObserver,
         mpsc::Sender<GitObserverCommand>,
         Arc<Mutex<Store>>,
+        tempfile::TempDir,
     ) {
         let db_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(Mutex::new(
             Store::open(&db_dir.path().join("test.db")).unwrap(),
         ));
-
-        // Leak the TempDir so it doesn't get cleaned up while in use
-        // (the store keeps a connection to the db file)
-        let _ = Box::leak(Box::new(db_dir));
 
         store
             .lock()
@@ -331,13 +328,13 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
         let observer = GitObserver::new(store.clone(), cmd_rx);
-        (observer, cmd_tx, store)
+        (observer, cmd_tx, store, db_dir)
     }
 
     #[tokio::test]
     async fn test_observer_creates_attributions_on_commit() {
         let dir = init_test_repo();
-        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+        let (mut observer, cmd_tx, store, _db_dir) = setup_observer(dir.path()).await;
 
         cmd_tx
             .send(GitObserverCommand::TrackRepo {
@@ -443,7 +440,7 @@ mod tests {
     async fn test_observer_handles_deleted_repo() {
         let dir = init_test_repo();
         let repo_path = dir.path().to_path_buf();
-        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+        let (mut observer, cmd_tx, _store, _db_dir) = setup_observer(dir.path()).await;
 
         cmd_tx
             .send(GitObserverCommand::TrackRepo {
@@ -468,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn test_observer_multiple_sessions_same_repo() {
         let dir = init_test_repo();
-        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+        let (mut observer, cmd_tx, store, _db_dir) = setup_observer(dir.path()).await;
 
         // Create second session
         store
@@ -551,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn test_observer_detects_amend() {
         let dir = init_test_repo();
-        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+        let (mut observer, cmd_tx, store, _db_dir) = setup_observer(dir.path()).await;
 
         cmd_tx
             .send(GitObserverCommand::TrackRepo {
@@ -603,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn test_observer_detects_reset() {
         let dir = init_test_repo();
-        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+        let (mut observer, cmd_tx, store, _db_dir) = setup_observer(dir.path()).await;
 
         cmd_tx
             .send(GitObserverCommand::TrackRepo {
@@ -660,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn test_observer_detects_new_commit() {
         let dir = init_test_repo();
-        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+        let (mut observer, cmd_tx, store, _db_dir) = setup_observer(dir.path()).await;
 
         // Tell observer to track this repo and process the command
         cmd_tx

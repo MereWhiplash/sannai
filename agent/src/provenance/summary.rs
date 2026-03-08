@@ -72,12 +72,13 @@ pub fn generate_summary(bundle: &ProvenanceBundle, config: &SummaryConfig) -> Op
 }
 
 fn run_llm_command(command: &str, prompt: &str) -> Result<String> {
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parts = shell_words::split(command)
+        .map_err(|e| anyhow::anyhow!("Failed to parse LLM command: {}", e))?;
     if parts.is_empty() {
         anyhow::bail!("Empty LLM command");
     }
 
-    let mut child = Command::new(parts[0])
+    let mut child = Command::new(&parts[0])
         .args(&parts[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
