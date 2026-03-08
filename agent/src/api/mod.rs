@@ -35,6 +35,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/events", get(get_session_events))
+        .route("/sessions/:id/git-events", get(get_session_git_events))
+        .route("/sessions/:id/commits", get(get_session_commits))
+        .route("/sessions/:id/attributions", get(get_session_attributions))
+        .route("/commits/:sha/attributions", get(get_commit_attributions))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -214,4 +218,79 @@ async fn get_session_events(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(events))
+}
+
+// --- GET /sessions/:id/git-events ---
+
+async fn get_session_git_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<store::GitEvent>>, StatusCode> {
+    let store = state.store.lock().await;
+
+    store
+        .get_session(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let events = store
+        .get_git_events_for_session(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(events))
+}
+
+// --- GET /sessions/:id/commits ---
+
+async fn get_session_commits(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<store::CommitLink>>, StatusCode> {
+    let store = state.store.lock().await;
+
+    store
+        .get_session(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let links = store
+        .get_commit_links_for_session(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(links))
+}
+
+// --- GET /sessions/:id/attributions ---
+
+async fn get_session_attributions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<store::Attribution>>, StatusCode> {
+    let store = state.store.lock().await;
+
+    store
+        .get_session(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let attrs = store
+        .get_attributions_for_session(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(attrs))
+}
+
+// --- GET /commits/:sha/attributions ---
+
+async fn get_commit_attributions(
+    State(state): State<AppState>,
+    Path(sha): Path<String>,
+) -> Result<Json<Vec<store::Attribution>>, StatusCode> {
+    let store = state.store.lock().await;
+
+    let attrs = store
+        .get_attributions_for_commit(&sha)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(attrs))
 }

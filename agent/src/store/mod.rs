@@ -513,6 +513,35 @@ impl Store {
         Ok(attrs)
     }
 
+    pub fn get_attributions_for_session(&self, session_id: &str) -> Result<Vec<Attribution>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, commit_sha, session_id, file_path, hunk_start, hunk_end, event_id, confidence, attribution_type, method, created_at
+             FROM attributions WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(Attribution {
+                id: Some(row.get(0)?),
+                commit_sha: row.get(1)?,
+                session_id: row.get(2)?,
+                file_path: row.get(3)?,
+                hunk_start: row.get(4)?,
+                hunk_end: row.get(5)?,
+                event_id: row.get(6)?,
+                confidence: row.get(7)?,
+                attribution_type: row.get(8)?,
+                method: row.get(9)?,
+                created_at: parse_datetime(row.get::<_, String>(10)?),
+            })
+        })?;
+
+        let mut attrs = Vec::new();
+        for row in rows {
+            attrs.push(row?);
+        }
+        Ok(attrs)
+    }
+
     pub fn get_active_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, tool, project_path, started_at, ended_at, synced_at, metadata
