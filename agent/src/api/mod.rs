@@ -93,6 +93,11 @@ async fn hook_commit(
             session_id: session_id.clone(),
             repo_path: req.repo.clone(),
             linked_at: chrono::Utc::now(),
+            parent_shas: None,
+            message: None,
+            files_changed: None,
+            diff_stat: None,
+            detection_method: Some("hook".to_string()),
         };
         if let Err(e) = store.link_commit(&link) {
             tracing::warn!("Failed to link commit {} to session {}: {}", req.sha, session_id, e);

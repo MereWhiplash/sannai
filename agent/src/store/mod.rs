@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS commit_links (
     session_id TEXT NOT NULL REFERENCES sessions(id),
     repo_path TEXT NOT NULL,
     linked_at TEXT NOT NULL,
+    parent_shas TEXT,
+    message TEXT,
+    files_changed TEXT,
+    diff_stat TEXT,
+    detection_method TEXT,
     PRIMARY KEY (commit_sha, session_id)
 );
 
@@ -120,6 +125,11 @@ pub struct CommitLink {
     pub session_id: String,
     pub repo_path: String,
     pub linked_at: DateTime<Utc>,
+    pub parent_shas: Option<Vec<String>>,
+    pub message: Option<String>,
+    pub files_changed: Option<Vec<String>>,
+    pub diff_stat: Option<serde_json::Value>,
+    pub detection_method: Option<String>,
 }
 
 pub struct Store {
@@ -288,16 +298,54 @@ impl Store {
 
     pub fn link_commit(&self, link: &CommitLink) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO commit_links (commit_sha, session_id, repo_path, linked_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO commit_links (commit_sha, session_id, repo_path, linked_at, parent_shas, message, files_changed, diff_stat, detection_method)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 link.commit_sha,
                 link.session_id,
                 link.repo_path,
                 link.linked_at.to_rfc3339(),
+                link.parent_shas.as_ref().map(|v| serde_json::to_string(v).unwrap()),
+                link.message,
+                link.files_changed.as_ref().map(|v| serde_json::to_string(v).unwrap()),
+                link.diff_stat.as_ref().map(|v| v.to_string()),
+                link.detection_method,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_commit_links_for_session(&self, session_id: &str) -> Result<Vec<CommitLink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT commit_sha, session_id, repo_path, linked_at, parent_shas, message, files_changed, diff_stat, detection_method
+             FROM commit_links WHERE session_id = ?1 ORDER BY linked_at ASC",
+        )?;
+
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(CommitLink {
+                commit_sha: row.get(0)?,
+                session_id: row.get(1)?,
+                repo_path: row.get(2)?,
+                linked_at: parse_datetime(row.get::<_, String>(3)?),
+                parent_shas: row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                message: row.get(5)?,
+                files_changed: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                diff_stat: row
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                detection_method: row.get(8)?,
+            })
+        })?;
+
+        let mut links = Vec::new();
+        for row in rows {
+            links.push(row?);
+        }
+        Ok(links)
     }
 
     pub fn get_sessions_for_commit(&self, sha: &str) -> Result<Vec<Session>> {
@@ -662,6 +710,11 @@ mod tests {
             session_id: "commit-test-session".to_string(),
             repo_path: "/Users/test/repo".to_string(),
             linked_at: now,
+            parent_shas: None,
+            message: None,
+            files_changed: None,
+            diff_stat: None,
+            detection_method: None,
         };
         store.link_commit(&link).unwrap();
 
@@ -831,6 +884,48 @@ mod tests {
         let attrs = store.get_attributions_for_commit("abc123").unwrap();
         assert_eq!(attrs.len(), 1);
         assert!((attrs[0].confidence - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_enriched_commit_link() {
+        let (store, _dir) = test_store();
+        let now = Utc::now();
+
+        store
+            .upsert_session(&Session {
+                id: "enrich-session".to_string(),
+                tool: "claude_code".to_string(),
+                project_path: Some("/test/repo".to_string()),
+                started_at: now,
+                ended_at: None,
+                synced_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        let link = CommitLink {
+            commit_sha: "abc123".to_string(),
+            session_id: "enrich-session".to_string(),
+            repo_path: "/test/repo".to_string(),
+            linked_at: now,
+            parent_shas: Some(vec!["parent1".to_string()]),
+            message: Some("feat: add auth".to_string()),
+            files_changed: Some(vec!["src/auth.rs".to_string(), "Cargo.toml".to_string()]),
+            diff_stat: Some(serde_json::json!({"insertions": 45, "deletions": 3})),
+            detection_method: Some("poll".to_string()),
+        };
+
+        store.link_commit(&link).unwrap();
+
+        let sessions = store.get_sessions_for_commit("abc123").unwrap();
+        assert_eq!(sessions.len(), 1);
+
+        let links = store
+            .get_commit_links_for_session("enrich-session")
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].message.as_deref(), Some("feat: add auth"));
+        assert_eq!(links[0].detection_method.as_deref(), Some("poll"));
     }
 
     #[test]
