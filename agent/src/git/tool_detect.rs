@@ -20,7 +20,7 @@ pub fn detect_git_command(input: &str) -> Option<DetectedGitOp> {
 
     match *subcommand {
         "commit" => {
-            let amend = parts.iter().any(|&p| p == "--amend");
+            let amend = parts.contains(&"--amend");
             let message = extract_message_flag(&parts);
             Some(DetectedGitOp::Commit { amend, message })
         }
@@ -44,7 +44,7 @@ pub fn detect_git_command(input: &str) -> Option<DetectedGitOp> {
             Some(DetectedGitOp::Stash { pop })
         }
         "reset" => {
-            let hard = parts.iter().any(|&p| p == "--hard");
+            let hard = parts.contains(&"--hard");
             Some(DetectedGitOp::Reset { hard })
         }
         "merge" => Some(DetectedGitOp::Rebase), // treat merge like rebase for detection
