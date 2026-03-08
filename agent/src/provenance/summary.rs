@@ -194,7 +194,7 @@ fn build_prompt(bundle: &ProvenanceBundle) -> String {
          4. Any areas a reviewer should scrutinize (e.g., complex logic, patterns suggesting \
             the AI struggled, or areas that needed multiple attempts)\n\n\
          IMPORTANT: All code produced during an AI coding session should be considered \
-         AI-generated, even if attribution is \"unattributed\" — that label means the \
+         AI-generated, even if attribution is \"unattributed\" \u{2014} that label means the \
          tool couldn't match the exact content, NOT that the code was written manually. \
          If sessions exist, assume the developer used AI for the work.\n\n\
          Do NOT list files or repeat raw numbers. Synthesize the data into a narrative.\n",
