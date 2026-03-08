@@ -33,10 +33,21 @@ CREATE TABLE IF NOT EXISTS commit_links (
     PRIMARY KEY (commit_sha, session_id)
 );
 
+CREATE TABLE IF NOT EXISTS git_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    repo_path TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_commits_sha ON commit_links(commit_sha);
 CREATE INDEX IF NOT EXISTS idx_sessions_ended ON sessions(ended_at);
+CREATE INDEX IF NOT EXISTS idx_git_events_session ON git_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_git_events_timestamp ON git_events(timestamp);
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +70,16 @@ pub struct Event {
     pub context_files: Option<serde_json::Value>,
     pub timestamp: DateTime<Utc>,
     pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitEvent {
+    pub id: Option<i64>,
+    pub session_id: String,
+    pub repo_path: String,
+    pub event_type: String,
+    pub timestamp: DateTime<Utc>,
+    pub data: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +295,49 @@ impl Store {
             sessions.push(row?);
         }
         Ok(sessions)
+    }
+
+    // --- Git events ---
+
+    pub fn insert_git_event(&self, event: &GitEvent) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO git_events (session_id, repo_path, event_type, timestamp, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.session_id,
+                event.repo_path,
+                event.event_type,
+                event.timestamp.to_rfc3339(),
+                event.data.to_string(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_git_events_for_session(&self, session_id: &str) -> Result<Vec<GitEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, repo_path, event_type, timestamp, data
+             FROM git_events WHERE session_id = ?1 ORDER BY timestamp ASC",
+        )?;
+
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(GitEvent {
+                id: Some(row.get(0)?),
+                session_id: row.get(1)?,
+                repo_path: row.get(2)?,
+                event_type: row.get(3)?,
+                timestamp: parse_datetime(row.get::<_, String>(4)?),
+                data: row
+                    .get::<_, String>(5)
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+            })
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
     }
 
     pub fn get_active_sessions(&self) -> Result<Vec<Session>> {
@@ -556,6 +620,47 @@ mod tests {
         let active = store.get_active_sessions().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, "active-1");
+    }
+
+    #[test]
+    fn test_insert_and_get_git_events() {
+        let (store, _dir) = test_store();
+        let now = Utc::now();
+
+        store
+            .upsert_session(&Session {
+                id: "git-test-session".to_string(),
+                tool: "claude_code".to_string(),
+                project_path: Some("/test/repo".to_string()),
+                started_at: now,
+                ended_at: None,
+                synced_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        let event = GitEvent {
+            id: None,
+            session_id: "git-test-session".to_string(),
+            repo_path: "/test/repo".to_string(),
+            event_type: "head_changed".to_string(),
+            timestamp: now,
+            data: serde_json::json!({
+                "old_sha": "aaa111",
+                "new_sha": "bbb222",
+                "branch": "main",
+                "cause": "commit"
+            }),
+        };
+
+        store.insert_git_event(&event).unwrap();
+
+        let events = store
+            .get_git_events_for_session("git-test-session")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "head_changed");
+        assert_eq!(events[0].data["new_sha"], "bbb222");
     }
 
     #[test]
