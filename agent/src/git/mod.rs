@@ -119,6 +119,59 @@ pub fn infer_head_change_cause(
     Ok(HeadChangeCause::Unknown)
 }
 
+pub struct CommitDetails {
+    pub sha: String,
+    pub parent_shas: Vec<String>,
+    pub message: String,
+    pub author: String,
+    pub files_changed: Vec<String>,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+pub fn get_commit_details(repo_path: &Path, sha: &str) -> anyhow::Result<CommitDetails> {
+    let repo = Repository::open(repo_path)?;
+    let oid = git2::Oid::from_str(sha)?;
+    let commit = repo.find_commit(oid)?;
+
+    let message = commit.message().unwrap_or("").trim().to_string();
+    let author = commit.author().name().unwrap_or("unknown").to_string();
+    let parent_shas: Vec<String> = commit.parent_ids().map(|id| id.to_string()).collect();
+
+    let tree = commit.tree()?;
+    let parent_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0)?.tree()?)
+    } else {
+        None
+    };
+
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+    let stats = diff.stats()?;
+
+    let mut files_changed = Vec::new();
+    diff.foreach(
+        &mut |delta, _| {
+            if let Some(path) = delta.new_file().path().and_then(|p| p.to_str()) {
+                files_changed.push(path.to_string());
+            }
+            true
+        },
+        None,
+        None,
+        None,
+    )?;
+
+    Ok(CommitDetails {
+        sha: sha.to_string(),
+        parent_shas,
+        message,
+        author,
+        files_changed,
+        insertions: stats.insertions() as u32,
+        deletions: stats.deletions() as u32,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +242,32 @@ mod tests {
         let state = read_repo_state(dir.path()).unwrap();
         assert_eq!(state.dirty_files.len(), 1);
         assert_eq!(state.dirty_files[0].path, "new.txt");
+    }
+
+    #[test]
+    fn test_get_commit_details() {
+        let dir = init_test_repo();
+
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add main"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let state = read_repo_state(dir.path()).unwrap();
+        let details = get_commit_details(dir.path(), &state.head_sha).unwrap();
+
+        assert_eq!(details.message, "add main");
+        assert!(!details.parent_shas.is_empty());
+        assert!(details.files_changed.contains(&"src/main.rs".to_string()));
+        assert!(details.insertions > 0);
     }
 
     #[test]
