@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::store::{self, Store};
 
+use super::attribute::attribute_commit;
 use super::{get_commit_details, infer_head_change_cause, read_repo_state, HeadChangeCause};
 
 pub enum GitObserverCommand {
@@ -25,6 +26,7 @@ struct TrackedRepo {
     repo_path: PathBuf,
     session_ids: Vec<String>,
     last_head_sha: String,
+    last_poll_at: DateTime<Utc>,
 }
 
 pub struct GitObserver {
@@ -79,6 +81,7 @@ impl GitObserver {
                         repo_path,
                         session_ids: vec![session_id],
                         last_head_sha: state.head_sha,
+                        last_poll_at: Utc::now(),
                     });
                 }
             }
@@ -206,9 +209,45 @@ impl GitObserver {
             }
             drop(store);
 
+            // Run attribution for commit-like causes
+            let last_poll = tracked.last_poll_at;
+            if matches!(
+                cause,
+                HeadChangeCause::Commit
+                    | HeadChangeCause::Amend
+                    | HeadChangeCause::Merge
+                    | HeadChangeCause::CherryPick
+            ) {
+                for session_id in &session_ids {
+                    match attribute_commit(
+                        &self.store,
+                        &repo_path,
+                        &new_sha,
+                        session_id,
+                        last_poll,
+                        now,
+                    )
+                    .await
+                    {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                "Created {} attribution(s) for commit {}",
+                                count,
+                                &new_sha[..8.min(new_sha.len())]
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Attribution failed for {}: {}", &new_sha[..8.min(new_sha.len())], e);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // Update tracked state
             if let Some(tracked) = self.tracked.get_mut(&path) {
                 tracked.last_head_sha = new_sha;
+                tracked.last_poll_at = now;
             }
         }
     }
@@ -284,6 +323,111 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
         let observer = GitObserver::new(store.clone(), cmd_rx);
         (observer, cmd_tx, store)
+    }
+
+    #[tokio::test]
+    async fn test_observer_creates_attributions_on_commit() {
+        let dir = init_test_repo();
+        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+
+        cmd_tx
+            .send(GitObserverCommand::TrackRepo {
+                repo_path: dir.path().to_path_buf(),
+                session_id: "obs-session".to_string(),
+            })
+            .await
+            .unwrap();
+        observer.process_commands().await;
+
+        // Backdate the last_poll_at so events fall within the attribution window
+        let repo_path = dir.path().to_path_buf();
+        if let Some(tracked) = observer.tracked.get_mut(&repo_path) {
+            tracked.last_poll_at = Utc::now() - chrono::Duration::minutes(5);
+        }
+
+        let event_time = Utc::now();
+
+        // Insert a user prompt event
+        store
+            .lock()
+            .await
+            .insert_event(&store::Event {
+                id: None,
+                session_id: "obs-session".to_string(),
+                event_type: "user_prompt".to_string(),
+                content: Some("Write a hello module".to_string()),
+                context_files: None,
+                timestamp: event_time,
+                metadata: None,
+            })
+            .unwrap();
+
+        // Insert a Write tool_use event
+        let file_path = dir.path().join("hello.rs");
+        store
+            .lock()
+            .await
+            .insert_event(&store::Event {
+                id: None,
+                session_id: "obs-session".to_string(),
+                event_type: "tool_use".to_string(),
+                content: Some("Write".to_string()),
+                context_files: None,
+                timestamp: event_time + chrono::Duration::seconds(2),
+                metadata: Some(serde_json::json!({
+                    "tool_id": "toolu_attr",
+                    "input": {
+                        "file_path": file_path.to_string_lossy().to_string(),
+                        "content": "fn hello() {\n    println!(\"hello\");\n}\n"
+                    }
+                })),
+            })
+            .unwrap();
+
+        // Actually write the file and commit
+        std::fs::write(&file_path, "fn hello() {\n    println!(\"hello\");\n}\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add hello"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Poll the observer
+        observer.poll_repos().await;
+
+        // Verify git_event and commit_link were created
+        let head = crate::git::read_repo_state(dir.path()).unwrap().head_sha;
+        let events = store
+            .lock()
+            .await
+            .get_git_events_for_session("obs-session")
+            .unwrap();
+        assert!(!events.is_empty(), "Expected git events to be recorded");
+
+        let links = store
+            .lock()
+            .await
+            .get_commit_links_for_session("obs-session")
+            .unwrap();
+        assert!(!links.is_empty(), "Expected commit link to be created");
+
+        // Verify attributions were created
+        let attrs = store
+            .lock()
+            .await
+            .get_attributions_for_commit(&head)
+            .unwrap();
+        assert!(
+            !attrs.is_empty(),
+            "Expected attributions for commit {}",
+            head
+        );
+        assert_eq!(attrs[0].file_path, "hello.rs");
     }
 
     #[tokio::test]
