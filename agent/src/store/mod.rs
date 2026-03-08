@@ -377,6 +377,44 @@ impl Store {
         Ok(sessions)
     }
 
+    pub fn get_events_in_time_range(
+        &self,
+        session_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, event_type, content, context_files, timestamp, metadata
+             FROM events WHERE session_id = ?1 AND timestamp >= ?2 AND timestamp <= ?3
+             ORDER BY timestamp ASC",
+        )?;
+
+        let rows = stmt.query_map(
+            params![session_id, from.to_rfc3339(), to.to_rfc3339()],
+            |row| {
+                Ok(Event {
+                    id: Some(row.get(0)?),
+                    session_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    content: row.get(3)?,
+                    context_files: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    timestamp: parse_datetime(row.get::<_, String>(5)?),
+                    metadata: row
+                        .get::<_, Option<String>>(6)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                })
+            },
+        )?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
     // --- Git events ---
 
     pub fn insert_git_event(&self, event: &GitEvent) -> Result<i64> {
@@ -884,6 +922,47 @@ mod tests {
         let attrs = store.get_attributions_for_commit("abc123").unwrap();
         assert_eq!(attrs.len(), 1);
         assert!((attrs[0].confidence - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_get_events_in_time_range() {
+        let (store, _dir) = test_store();
+        let now = Utc::now();
+
+        store
+            .upsert_session(&Session {
+                id: "range-session".to_string(),
+                tool: "claude_code".to_string(),
+                project_path: None,
+                started_at: now,
+                ended_at: None,
+                synced_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        // Insert events at different times
+        for i in 0..5 {
+            store
+                .insert_event(&Event {
+                    id: None,
+                    session_id: "range-session".to_string(),
+                    event_type: "tool_use".to_string(),
+                    content: Some(format!("event-{}", i)),
+                    context_files: None,
+                    timestamp: now + chrono::Duration::minutes(i),
+                    metadata: None,
+                })
+                .unwrap();
+        }
+
+        // Get events between minute 1 and minute 3
+        let from = now + chrono::Duration::minutes(1);
+        let to = now + chrono::Duration::minutes(3);
+        let events = store
+            .get_events_in_time_range("range-session", from, to)
+            .unwrap();
+        assert_eq!(events.len(), 3); // minutes 1, 2, 3
     }
 
     #[test]
