@@ -116,11 +116,20 @@ impl GitObserver {
             let state = match read_repo_state(&tracked.repo_path) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to read repo state for {}: {}",
-                        tracked.repo_path.display(),
-                        e
-                    );
+                    // If repo directory no longer exists, untrack it
+                    if !tracked.repo_path.exists() {
+                        tracing::warn!(
+                            "Repo directory deleted, untracking: {}",
+                            tracked.repo_path.display()
+                        );
+                        self.tracked.remove(&path);
+                    } else {
+                        tracing::warn!(
+                            "Failed to read repo state for {}: {}",
+                            tracked.repo_path.display(),
+                            e
+                        );
+                    }
                     continue;
                 }
             };
@@ -428,6 +437,115 @@ mod tests {
             head
         );
         assert_eq!(attrs[0].file_path, "hello.rs");
+    }
+
+    #[tokio::test]
+    async fn test_observer_handles_deleted_repo() {
+        let dir = init_test_repo();
+        let repo_path = dir.path().to_path_buf();
+        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+
+        cmd_tx
+            .send(GitObserverCommand::TrackRepo {
+                repo_path: repo_path.clone(),
+                session_id: "obs-session".to_string(),
+            })
+            .await
+            .unwrap();
+        observer.process_commands().await;
+        assert!(observer.tracked.contains_key(&repo_path));
+
+        // Delete the repo directory
+        drop(dir);
+
+        // Poll should handle the error gracefully and untrack
+        observer.poll_repos().await;
+
+        // Should have been untracked
+        assert!(!observer.tracked.contains_key(&repo_path));
+    }
+
+    #[tokio::test]
+    async fn test_observer_multiple_sessions_same_repo() {
+        let dir = init_test_repo();
+        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+
+        // Create second session
+        store
+            .lock()
+            .await
+            .upsert_session(&store::Session {
+                id: "obs-session-2".to_string(),
+                tool: "claude_code".to_string(),
+                project_path: Some(dir.path().to_string_lossy().to_string()),
+                started_at: Utc::now(),
+                ended_at: None,
+                synced_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        // Track same repo for two sessions
+        cmd_tx
+            .send(GitObserverCommand::TrackRepo {
+                repo_path: dir.path().to_path_buf(),
+                session_id: "obs-session".to_string(),
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(GitObserverCommand::TrackRepo {
+                repo_path: dir.path().to_path_buf(),
+                session_id: "obs-session-2".to_string(),
+            })
+            .await
+            .unwrap();
+        observer.process_commands().await;
+
+        // Should have a single tracked repo with two session IDs
+        let tracked = observer.tracked.get(dir.path()).unwrap();
+        assert_eq!(tracked.session_ids.len(), 2);
+
+        // Make a commit
+        std::fs::write(dir.path().join("new.txt"), "hello").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "multi-session commit"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        observer.poll_repos().await;
+
+        // Both sessions should have git events
+        let events1 = store
+            .lock()
+            .await
+            .get_git_events_for_session("obs-session")
+            .unwrap();
+        let events2 = store
+            .lock()
+            .await
+            .get_git_events_for_session("obs-session-2")
+            .unwrap();
+        assert_eq!(events1.len(), 1);
+        assert_eq!(events2.len(), 1);
+
+        // Untrack one session — repo should still be tracked
+        cmd_tx
+            .send(GitObserverCommand::UntrackSession {
+                session_id: "obs-session".to_string(),
+            })
+            .await
+            .unwrap();
+        observer.process_commands().await;
+        let tracked = observer.tracked.get(dir.path()).unwrap();
+        assert_eq!(tracked.session_ids.len(), 1);
+        assert_eq!(tracked.session_ids[0], "obs-session-2");
     }
 
     #[tokio::test]
