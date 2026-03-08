@@ -18,6 +18,7 @@ pub enum GitObserverCommand {
     UntrackSession {
         session_id: String,
     },
+    ImmediatePoll,
 }
 
 struct TrackedRepo {
@@ -51,6 +52,11 @@ impl GitObserver {
                     tracing::info!("Git observer shutting down");
                     break;
                 }
+                Some(cmd) = self.cmd_rx.recv() => {
+                    self.handle_command(cmd).await;
+                    self.process_commands().await;
+                    self.poll_repos().await;
+                }
                 _ = poll_interval.tick() => {
                     self.process_commands().await;
                     self.poll_repos().await;
@@ -60,58 +66,43 @@ impl GitObserver {
         Ok(())
     }
 
-    pub async fn process_commands(&mut self) {
-        while let Ok(cmd) = self.cmd_rx.try_recv() {
-            match cmd {
-                GitObserverCommand::TrackRepo {
-                    repo_path,
-                    session_id,
-                } => {
-                    if let Some(tracked) = self.tracked.get_mut(&repo_path) {
-                        if !tracked.session_ids.contains(&session_id) {
-                            tracked.session_ids.push(session_id.clone());
-                        }
-                    } else {
-                        // Read initial state
-                        match read_repo_state(&repo_path) {
-                            Ok(state) => {
-                                tracing::info!(
-                                    "Tracking repo {} for session {}",
-                                    repo_path.display(),
-                                    session_id
-                                );
-                                self.tracked.insert(
-                                    repo_path.clone(),
-                                    TrackedRepo {
-                                        repo_path,
-                                        session_ids: vec![session_id],
-                                        last_head_sha: state.head_sha,
-                                    },
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to read repo state for {}: {}",
-                                    repo_path.display(),
-                                    e
-                                );
-                            }
-                        }
+    async fn handle_command(&mut self, cmd: GitObserverCommand) {
+        match cmd {
+            GitObserverCommand::TrackRepo { repo_path, session_id } => {
+                if let Some(tracked) = self.tracked.get_mut(&repo_path) {
+                    if !tracked.session_ids.contains(&session_id) {
+                        tracked.session_ids.push(session_id);
                     }
-                }
-                GitObserverCommand::UntrackSession { session_id } => {
-                    let mut to_remove = Vec::new();
-                    for (path, tracked) in self.tracked.iter_mut() {
-                        tracked.session_ids.retain(|id| id != &session_id);
-                        if tracked.session_ids.is_empty() {
-                            to_remove.push(path.clone());
-                        }
-                    }
-                    for path in to_remove {
-                        self.tracked.remove(&path);
-                    }
+                } else if let Ok(state) = read_repo_state(&repo_path) {
+                    tracing::info!("Tracking repo {} for session {}", repo_path.display(), session_id);
+                    self.tracked.insert(repo_path.clone(), TrackedRepo {
+                        repo_path,
+                        session_ids: vec![session_id],
+                        last_head_sha: state.head_sha,
+                    });
                 }
             }
+            GitObserverCommand::UntrackSession { session_id } => {
+                let mut to_remove = Vec::new();
+                for (path, tracked) in self.tracked.iter_mut() {
+                    tracked.session_ids.retain(|id| id != &session_id);
+                    if tracked.session_ids.is_empty() {
+                        to_remove.push(path.clone());
+                    }
+                }
+                for path in to_remove {
+                    self.tracked.remove(&path);
+                }
+            }
+            GitObserverCommand::ImmediatePoll => {
+                // Handled by the poll_repos call after this
+            }
+        }
+    }
+
+    pub async fn process_commands(&mut self) {
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            self.handle_command(cmd).await;
         }
     }
 

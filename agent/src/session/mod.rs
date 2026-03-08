@@ -1,12 +1,13 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::git;
 use crate::git::observer::GitObserverCommand;
+use crate::git::tool_detect;
 use crate::parser::ParsedEvent;
 use crate::store::{self, Store};
 use crate::watcher::WatcherEvent;
@@ -35,6 +36,8 @@ pub struct SessionManager {
     active_sessions: HashMap<String, ActiveSession>,
     idle_timeout: Duration,
     git_cmd_tx: Option<mpsc::Sender<GitObserverCommand>>,
+    /// Tool IDs of Bash tool_use calls that contained git commands
+    pending_git_tool_ids: HashSet<String>,
 }
 
 impl SessionManager {
@@ -44,6 +47,7 @@ impl SessionManager {
             active_sessions: HashMap::new(),
             idle_timeout: Duration::minutes(idle_timeout_minutes),
             git_cmd_tx: None,
+            pending_git_tool_ids: HashSet::new(),
         }
     }
 
@@ -199,6 +203,15 @@ impl SessionManager {
                 )
                 .await?;
 
+                // Check if this is a Bash tool call with a git command
+                if tool_name == "Bash" {
+                    if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
+                        if tool_detect::detect_git_command(command).is_some() {
+                            self.pending_git_tool_ids.insert(tool_id.clone());
+                        }
+                    }
+                }
+
                 if let Some(active) = self.active_sessions.get_mut(session_id) {
                     active.event_count += 1;
                     active.last_event_at = *timestamp;
@@ -228,6 +241,13 @@ impl SessionManager {
                     Some(metadata),
                 )
                 .await?;
+
+                // If this result is for a git tool call and it succeeded, trigger immediate poll
+                if !is_error && self.pending_git_tool_ids.remove(tool_use_id) {
+                    if let Some(ref git_tx) = self.git_cmd_tx {
+                        let _ = git_tx.try_send(GitObserverCommand::ImmediatePoll);
+                    }
+                }
 
                 if let Some(active) = self.active_sessions.get_mut(session_id) {
                     active.event_count += 1;
@@ -584,6 +604,67 @@ mod tests {
             }
             _ => panic!("Expected TrackRepo"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_git_bash_triggers_poll() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = Arc::new(Mutex::new(Store::open(&db_path).unwrap()));
+
+        let (git_cmd_tx, mut git_cmd_rx) =
+            mpsc::channel::<crate::git::observer::GitObserverCommand>(10);
+        let mut mgr = SessionManager::new(store.clone(), 10);
+        mgr.set_git_cmd_tx(git_cmd_tx);
+
+        let repo_dir = init_test_repo_for_session();
+        let now = Utc::now();
+
+        // First create a session
+        mgr.process_event(make_watcher_event(ParsedEvent::UserPrompt {
+            session_id: "git-poll-sess".to_string(),
+            uuid: "u-1".to_string(),
+            timestamp: now,
+            content: "Hello".to_string(),
+            cwd: Some(repo_dir.path().to_string_lossy().to_string()),
+            git_branch: Some("main".to_string()),
+        }))
+        .await
+        .unwrap();
+
+        // Drain the TrackRepo command
+        let _ = git_cmd_rx.try_recv();
+
+        // Send a Bash tool_use with git commit
+        mgr.process_event(make_watcher_event(ParsedEvent::ToolUse {
+            session_id: "git-poll-sess".to_string(),
+            uuid: "a-1".to_string(),
+            timestamp: now + Duration::seconds(1),
+            tool_name: "Bash".to_string(),
+            tool_id: "toolu_git_01".to_string(),
+            input: serde_json::json!({"command": "git commit -m 'test'"}),
+        }))
+        .await
+        .unwrap();
+
+        // No poll yet — tool hasn't completed
+        assert!(git_cmd_rx.try_recv().is_err());
+
+        // Send successful tool result
+        mgr.process_event(make_watcher_event(ParsedEvent::ToolResult {
+            session_id: "git-poll-sess".to_string(),
+            uuid: "a-1".to_string(),
+            timestamp: now + Duration::seconds(2),
+            tool_use_id: "toolu_git_01".to_string(),
+            is_error: false,
+            content: Some("1 file changed".to_string()),
+        }))
+        .await
+        .unwrap();
+
+        // Should have sent ImmediatePoll
+        let cmd = git_cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, crate::git::observer::GitObserverCommand::ImmediatePoll));
     }
 
     fn init_test_repo_for_session() -> tempfile::TempDir {
