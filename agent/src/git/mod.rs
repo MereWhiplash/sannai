@@ -1,3 +1,4 @@
+pub mod attribute;
 pub mod observer;
 pub mod tool_detect;
 
