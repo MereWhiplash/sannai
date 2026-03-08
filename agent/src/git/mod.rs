@@ -1,3 +1,5 @@
+pub mod observer;
+
 use git2::Repository;
 use std::path::{Path, PathBuf};
 

@@ -1,0 +1,348 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use chrono::Utc;
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
+
+use crate::store::{self, Store};
+
+use super::{get_commit_details, infer_head_change_cause, read_repo_state, HeadChangeCause};
+
+pub enum GitObserverCommand {
+    TrackRepo {
+        repo_path: PathBuf,
+        session_id: String,
+    },
+    UntrackSession {
+        session_id: String,
+    },
+}
+
+struct TrackedRepo {
+    repo_path: PathBuf,
+    session_ids: Vec<String>,
+    last_head_sha: String,
+}
+
+pub struct GitObserver {
+    store: Arc<Mutex<Store>>,
+    cmd_rx: mpsc::Receiver<GitObserverCommand>,
+    tracked: HashMap<PathBuf, TrackedRepo>,
+}
+
+impl GitObserver {
+    pub fn new(store: Arc<Mutex<Store>>, cmd_rx: mpsc::Receiver<GitObserverCommand>) -> Self {
+        Self {
+            store,
+            cmd_rx,
+            tracked: HashMap::new(),
+        }
+    }
+
+    pub async fn run(&mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3));
+        tracing::info!("Git observer started");
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    tracing::info!("Git observer shutting down");
+                    break;
+                }
+                _ = poll_interval.tick() => {
+                    self.process_commands().await;
+                    self.poll_repos().await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn process_commands(&mut self) {
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            match cmd {
+                GitObserverCommand::TrackRepo {
+                    repo_path,
+                    session_id,
+                } => {
+                    if let Some(tracked) = self.tracked.get_mut(&repo_path) {
+                        if !tracked.session_ids.contains(&session_id) {
+                            tracked.session_ids.push(session_id.clone());
+                        }
+                    } else {
+                        // Read initial state
+                        match read_repo_state(&repo_path) {
+                            Ok(state) => {
+                                tracing::info!(
+                                    "Tracking repo {} for session {}",
+                                    repo_path.display(),
+                                    session_id
+                                );
+                                self.tracked.insert(
+                                    repo_path.clone(),
+                                    TrackedRepo {
+                                        repo_path,
+                                        session_ids: vec![session_id],
+                                        last_head_sha: state.head_sha,
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to read repo state for {}: {}",
+                                    repo_path.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                GitObserverCommand::UntrackSession { session_id } => {
+                    let mut to_remove = Vec::new();
+                    for (path, tracked) in self.tracked.iter_mut() {
+                        tracked.session_ids.retain(|id| id != &session_id);
+                        if tracked.session_ids.is_empty() {
+                            to_remove.push(path.clone());
+                        }
+                    }
+                    for path in to_remove {
+                        self.tracked.remove(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn poll_repos(&mut self) {
+        let paths: Vec<PathBuf> = self.tracked.keys().cloned().collect();
+        for path in paths {
+            let tracked = self.tracked.get(&path).unwrap();
+            let state = match read_repo_state(&tracked.repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read repo state for {}: {}",
+                        tracked.repo_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            if state.head_sha == tracked.last_head_sha {
+                continue;
+            }
+
+            let old_sha = tracked.last_head_sha.clone();
+            let new_sha = state.head_sha.clone();
+            let repo_path = tracked.repo_path.clone();
+            let session_ids = tracked.session_ids.clone();
+
+            let cause = infer_head_change_cause(&repo_path, &old_sha, &new_sha)
+                .unwrap_or(HeadChangeCause::Unknown);
+
+            let cause_str = match &cause {
+                HeadChangeCause::Commit => "commit",
+                HeadChangeCause::Amend => "amend",
+                HeadChangeCause::Rebase => "rebase",
+                HeadChangeCause::Checkout => "checkout",
+                HeadChangeCause::Reset => "reset",
+                HeadChangeCause::Merge => "merge",
+                HeadChangeCause::CherryPick => "cherry_pick",
+                HeadChangeCause::Unknown => "unknown",
+            };
+
+            tracing::info!(
+                "HEAD changed in {}: {} -> {} (cause: {})",
+                repo_path.display(),
+                &old_sha[..8.min(old_sha.len())],
+                &new_sha[..8.min(new_sha.len())],
+                cause_str
+            );
+
+            let now = Utc::now();
+            let store = self.store.lock().await;
+
+            for session_id in &session_ids {
+                // Record git_event
+                let git_event = store::GitEvent {
+                    id: None,
+                    session_id: session_id.clone(),
+                    repo_path: repo_path.to_string_lossy().to_string(),
+                    event_type: "head_changed".to_string(),
+                    timestamp: now,
+                    data: serde_json::json!({
+                        "old_sha": old_sha,
+                        "new_sha": new_sha,
+                        "cause": cause_str,
+                    }),
+                };
+                if let Err(e) = store.insert_git_event(&git_event) {
+                    tracing::warn!("Failed to insert git event: {}", e);
+                }
+
+                // For commit-like causes, create a commit_link with details
+                if matches!(
+                    cause,
+                    HeadChangeCause::Commit
+                        | HeadChangeCause::Amend
+                        | HeadChangeCause::Merge
+                        | HeadChangeCause::CherryPick
+                ) {
+                    let details = get_commit_details(&repo_path, &new_sha).ok();
+                    let link = store::CommitLink {
+                        commit_sha: new_sha.clone(),
+                        session_id: session_id.clone(),
+                        repo_path: repo_path.to_string_lossy().to_string(),
+                        linked_at: now,
+                        parent_shas: details.as_ref().map(|d| d.parent_shas.clone()),
+                        message: details.as_ref().map(|d| d.message.clone()),
+                        files_changed: details.as_ref().map(|d| d.files_changed.clone()),
+                        diff_stat: details.as_ref().map(|d| {
+                            serde_json::json!({
+                                "insertions": d.insertions,
+                                "deletions": d.deletions,
+                            })
+                        }),
+                        detection_method: Some("poll".to_string()),
+                    };
+                    if let Err(e) = store.link_commit(&link) {
+                        tracing::warn!("Failed to link commit: {}", e);
+                    }
+                }
+            }
+            drop(store);
+
+            // Update tracked state
+            if let Some(tracked) = self.tracked.get_mut(&path) {
+                tracked.last_head_sha = new_sha;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::read_repo_state;
+    use std::process::Command;
+
+    fn init_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# test").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        dir
+    }
+
+    async fn setup_observer(
+        repo_dir: &std::path::Path,
+    ) -> (
+        GitObserver,
+        mpsc::Sender<GitObserverCommand>,
+        Arc<Mutex<Store>>,
+    ) {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(&db_dir.path().join("test.db")).unwrap(),
+        ));
+
+        // Leak the TempDir so it doesn't get cleaned up while in use
+        // (the store keeps a connection to the db file)
+        let _ = Box::leak(Box::new(db_dir));
+
+        store
+            .lock()
+            .await
+            .upsert_session(&store::Session {
+                id: "obs-session".to_string(),
+                tool: "claude_code".to_string(),
+                project_path: Some(repo_dir.to_string_lossy().to_string()),
+                started_at: Utc::now(),
+                ended_at: None,
+                synced_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(10);
+        let observer = GitObserver::new(store.clone(), cmd_rx);
+        (observer, cmd_tx, store)
+    }
+
+    #[tokio::test]
+    async fn test_observer_detects_new_commit() {
+        let dir = init_test_repo();
+        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+
+        // Tell observer to track this repo and process the command
+        cmd_tx
+            .send(GitObserverCommand::TrackRepo {
+                repo_path: dir.path().to_path_buf(),
+                session_id: "obs-session".to_string(),
+            })
+            .await
+            .unwrap();
+        observer.process_commands().await;
+
+        // Make a commit in the test repo AFTER tracking starts
+        std::fs::write(dir.path().join("new.txt"), "hello").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "detected commit"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Poll to detect the change
+        observer.poll_repos().await;
+
+        // Check that a git_event was recorded
+        let events = store
+            .lock()
+            .await
+            .get_git_events_for_session("obs-session")
+            .unwrap();
+        assert!(!events.is_empty());
+        assert_eq!(events.last().unwrap().event_type, "head_changed");
+
+        // Check that a commit_link was created
+        let head_sha = read_repo_state(dir.path()).unwrap().head_sha;
+        let linked = store
+            .lock()
+            .await
+            .get_sessions_for_commit(&head_sha)
+            .unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].id, "obs-session");
+    }
+}
