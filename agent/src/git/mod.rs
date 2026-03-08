@@ -19,6 +19,18 @@ pub enum FileStatus {
     Renamed,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeadChangeCause {
+    Commit,
+    Amend,
+    Rebase,
+    Checkout,
+    Reset,
+    Merge,
+    CherryPick,
+    Unknown,
+}
+
 pub fn discover_repo(path: &Path) -> Option<PathBuf> {
     Repository::discover(path)
         .ok()
@@ -57,6 +69,54 @@ pub fn read_repo_state(repo_path: &Path) -> anyhow::Result<RepoState> {
         branch,
         dirty_files,
     })
+}
+
+pub fn infer_head_change_cause(
+    repo_path: &Path,
+    old_sha: &str,
+    new_sha: &str,
+) -> anyhow::Result<HeadChangeCause> {
+    if old_sha == new_sha {
+        return Ok(HeadChangeCause::Unknown);
+    }
+
+    let repo = Repository::open(repo_path)?;
+    let old_oid = git2::Oid::from_str(old_sha)?;
+    let new_oid = git2::Oid::from_str(new_sha)?;
+    let new_commit = repo.find_commit(new_oid)?;
+
+    // Merge: multiple parents
+    if new_commit.parent_count() > 1 {
+        return Ok(HeadChangeCause::Merge);
+    }
+
+    // Check if old_sha is direct parent of new_sha (normal commit)
+    if new_commit.parent_count() == 1 {
+        let parent = new_commit.parent(0)?;
+        if parent.id() == old_oid {
+            return Ok(HeadChangeCause::Commit);
+        }
+
+        // Same parent as old commit = amend
+        if let Ok(old_commit) = repo.find_commit(old_oid) {
+            if old_commit.parent_count() == 1 && old_commit.parent(0)?.id() == parent.id() {
+                return Ok(HeadChangeCause::Amend);
+            }
+        }
+    }
+
+    // new_sha is ancestor of old_sha = reset (went backwards)
+    if repo.graph_descendant_of(old_oid, new_oid)? {
+        return Ok(HeadChangeCause::Reset);
+    }
+
+    // old_sha is ancestor of new_sha but not direct parent = rebase or fast-forward
+    if repo.graph_descendant_of(new_oid, old_oid)? {
+        return Ok(HeadChangeCause::Rebase);
+    }
+
+    // Diverged — likely checkout or cherry-pick
+    Ok(HeadChangeCause::Unknown)
 }
 
 #[cfg(test)]
@@ -129,5 +189,97 @@ mod tests {
         let state = read_repo_state(dir.path()).unwrap();
         assert_eq!(state.dirty_files.len(), 1);
         assert_eq!(state.dirty_files[0].path, "new.txt");
+    }
+
+    #[test]
+    fn test_infer_cause_commit() {
+        let dir = init_test_repo();
+        let state_before = read_repo_state(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "second"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let state_after = read_repo_state(dir.path()).unwrap();
+        let cause =
+            infer_head_change_cause(dir.path(), &state_before.head_sha, &state_after.head_sha)
+                .unwrap();
+        assert_eq!(cause, HeadChangeCause::Commit);
+    }
+
+    #[test]
+    fn test_infer_cause_amend() {
+        let dir = init_test_repo();
+
+        std::fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "original"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let state_before = read_repo_state(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("file.txt"), "v2").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--amend", "-m", "amended"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let state_after = read_repo_state(dir.path()).unwrap();
+        let cause =
+            infer_head_change_cause(dir.path(), &state_before.head_sha, &state_after.head_sha)
+                .unwrap();
+        assert_eq!(cause, HeadChangeCause::Amend);
+    }
+
+    #[test]
+    fn test_infer_cause_reset() {
+        let dir = init_test_repo();
+        let initial_sha = read_repo_state(dir.path()).unwrap().head_sha;
+
+        std::fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "c1"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let state_before = read_repo_state(dir.path()).unwrap();
+
+        Command::new("git")
+            .args(["reset", "--hard", &initial_sha])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let state_after = read_repo_state(dir.path()).unwrap();
+        let cause =
+            infer_head_change_cause(dir.path(), &state_before.head_sha, &state_after.head_sha)
+                .unwrap();
+        assert_eq!(cause, HeadChangeCause::Reset);
     }
 }
