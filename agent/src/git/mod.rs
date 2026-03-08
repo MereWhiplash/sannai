@@ -1,4 +1,5 @@
 pub mod observer;
+pub mod tool_detect;
 
 use git2::Repository;
 use std::path::{Path, PathBuf};
