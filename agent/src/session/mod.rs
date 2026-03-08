@@ -170,17 +170,24 @@ impl SessionManager {
                 session_id,
                 timestamp,
                 tool_name,
+                tool_id,
+                input,
                 ..
             } => {
                 self.ensure_session(session_id, *timestamp, &project_dir, None, None)
                     .await?;
+
+                let metadata = serde_json::json!({
+                    "tool_id": tool_id,
+                    "input": input,
+                });
 
                 self.persist_event(
                     session_id,
                     "tool_use",
                     Some(tool_name),
                     *timestamp,
-                    None,
+                    Some(metadata),
                 )
                 .await?;
 
@@ -194,6 +201,7 @@ impl SessionManager {
                 timestamp,
                 tool_use_id,
                 is_error,
+                content,
                 ..
             } => {
                 self.ensure_session(session_id, *timestamp, &project_dir, None, None)
@@ -207,7 +215,7 @@ impl SessionManager {
                 self.persist_event(
                     session_id,
                     "tool_result",
-                    None,
+                    content.as_deref(),
                     *timestamp,
                     Some(metadata),
                 )

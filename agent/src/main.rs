@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use sannai_agent::{api, daemon, session, store, watcher};
+use sannai_agent::{api, comment, config, daemon, provenance, session, store, watcher};
 
 #[derive(Parser)]
 #[command(name = "sannai")]
@@ -31,6 +32,16 @@ enum Commands {
         /// Maximum number of sessions to display
         #[arg(long, default_value = "20")]
         limit: u32,
+    },
+    /// Post provenance comment on a GitHub PR
+    Comment {
+        /// PR URL (e.g., https://github.com/owner/repo/pull/123)
+        #[arg(long)]
+        pr: String,
+
+        /// Path to the git repository (defaults to current directory)
+        #[arg(long)]
+        repo: Option<String>,
     },
 }
 
@@ -84,9 +95,158 @@ async fn main() -> anyhow::Result<()> {
                 println!("\n{} session(s)", sessions.len());
             }
         }
+        Commands::Comment { pr, repo } => {
+            run_comment(&pr, repo.as_deref())?;
+        }
     }
 
     Ok(())
+}
+
+fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
+    let repo_path = repo_path
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        });
+
+    // 1. Load config
+    let cfg = config::load_config();
+
+    // 2. Get PR commit SHAs
+    println!("Fetching PR commits...");
+    let commit_shas = comment::github::get_pr_commits(pr_url)?;
+    if commit_shas.is_empty() {
+        println!("No commits found in this PR.");
+        return Ok(());
+    }
+    println!("Found {} commit(s)", commit_shas.len());
+
+    // 3. Open store and find linked sessions
+    let db_path = daemon::data_dir().join("store.db");
+    if !db_path.exists() {
+        anyhow::bail!("No Sannai database found. Has the agent been running?");
+    }
+    let store = store::Store::open(&db_path)?;
+
+    let mut session_ids = HashSet::new();
+    for sha in &commit_shas {
+        for s in store.get_sessions_for_commit(sha)? {
+            session_ids.insert(s.id);
+        }
+    }
+
+    // Fallback: match sessions by repo path
+    if session_ids.is_empty() {
+        println!("No commit-linked sessions found, trying project path matching...");
+        for session in store.list_sessions(100, 0)? {
+            if let Some(proj) = &session.project_path {
+                if proj == &repo_path
+                    || repo_path.ends_with(proj)
+                    || proj.ends_with(&repo_path)
+                {
+                    session_ids.insert(session.id);
+                }
+            }
+        }
+    }
+
+    if session_ids.is_empty() {
+        println!("No Sannai sessions found for this PR's commits.");
+        println!("Make sure the Sannai agent was running during development.");
+        return Ok(());
+    }
+
+    println!("Found {} session(s) with provenance data", session_ids.len());
+
+    // 4. Build interactions and lineage per session
+    let mut all_interactions = Vec::new();
+    let mut all_lineage = Vec::new();
+    let mut session_summaries = Vec::new();
+
+    for session_id in &session_ids {
+        let events = store.get_events_for_session(session_id)?;
+        let interactions =
+            provenance::interaction::build_interactions(session_id, &events);
+
+        let mut session_lineage = Vec::new();
+        for interaction in &interactions {
+            session_lineage.extend(provenance::lineage::build_lineage(interaction));
+        }
+
+        let duration = if let (Some(first), Some(last)) =
+            (interactions.first(), interactions.last())
+        {
+            format_duration(last.timestamp_end - first.timestamp_start)
+        } else {
+            "0m".to_string()
+        };
+
+        session_summaries.push(comment::format::SessionSummary {
+            session_id: session_id.clone(),
+            interactions: interactions.clone(),
+            lineage: session_lineage.clone(),
+            duration,
+        });
+
+        all_interactions.extend(interactions);
+        all_lineage.extend(session_lineage);
+    }
+
+    // 5. Diff attribution
+    println!("Computing diff attribution...");
+    let pr_diff = comment::github::get_pr_diff(pr_url).unwrap_or_default();
+    let all_attributions =
+        provenance::attribution::attribute_diff_text(&pr_diff, &all_interactions);
+
+    // 6. LLM summary (optional)
+    let llm_summary = if cfg.summary.enabled && !cfg.summary.command.is_empty() {
+        println!("Generating LLM summary...");
+        let bundle = provenance::summary::ProvenanceBundle {
+            interactions: all_interactions,
+            lineage: all_lineage,
+            attributions: all_attributions.clone(),
+            diff: pr_diff,
+        };
+        let summary_config = provenance::summary::SummaryConfig {
+            enabled: cfg.summary.enabled,
+            command: cfg.summary.command,
+            max_length: cfg.summary.max_length,
+        };
+        provenance::summary::generate_summary(&bundle, &summary_config)
+    } else {
+        None
+    };
+
+    // 7. Format comment
+    let comment_data = comment::format::CommentData {
+        sessions: session_summaries,
+        attributions: all_attributions,
+        llm_summary,
+    };
+    let comment_body = comment::format::format_comment(&comment_data);
+
+    // 8. Post to GitHub
+    println!("Posting comment to PR...");
+    comment::github::post_pr_comment(pr_url, &comment_body)?;
+    println!("Done! Provenance comment posted.");
+
+    Ok(())
+}
+
+fn format_duration(dur: chrono::Duration) -> String {
+    let total_seconds = dur.num_seconds();
+    if total_seconds < 60 {
+        format!("{}s", total_seconds)
+    } else if total_seconds < 3600 {
+        format!("{}m", total_seconds / 60)
+    } else {
+        let hours = total_seconds / 3600;
+        let minutes = (total_seconds % 3600) / 60;
+        format!("{}h {}m", hours, minutes)
+    }
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
