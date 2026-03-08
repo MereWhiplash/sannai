@@ -195,11 +195,42 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
         all_lineage.extend(session_lineage);
     }
 
-    // 5. Diff attribution
+    // 5. Diff attribution — prefer stored attributions, fall back to on-the-fly
     println!("Computing diff attribution...");
+    let mut all_attributions = Vec::new();
+    let mut has_stored = false;
+
+    for sha in &commit_shas {
+        let stored = store.get_attributions_for_commit(sha)?;
+        if !stored.is_empty() {
+            has_stored = true;
+            for attr in stored {
+                all_attributions.push(provenance::attribution::DiffAttribution {
+                    commit_sha: attr.commit_sha,
+                    file_path: attr.file_path,
+                    hunk_start: attr.hunk_start as u32,
+                    hunk_end: attr.hunk_end as u32,
+                    interaction_id: None,
+                    confidence: attr.confidence,
+                    attribution_type: match attr.attribution_type.as_str() {
+                        "AI-generated" => provenance::attribution::AttributionType::AiGenerated,
+                        "AI-assisted" => provenance::attribution::AttributionType::AiAssisted,
+                        "Manual" => provenance::attribution::AttributionType::Manual,
+                        _ => provenance::attribution::AttributionType::Unknown,
+                    },
+                });
+            }
+        }
+    }
+
     let pr_diff = comment::github::get_pr_diff(pr_url).unwrap_or_default();
-    let all_attributions =
-        provenance::attribution::attribute_diff_text(&pr_diff, &all_interactions);
+    if !has_stored {
+        println!("No stored attributions found, computing on-the-fly...");
+        all_attributions =
+            provenance::attribution::attribute_diff_text(&pr_diff, &all_interactions);
+    } else {
+        println!("Using {} stored attribution(s)", all_attributions.len());
+    }
 
     // 6. LLM summary (optional)
     let llm_summary = if cfg.summary.enabled && !cfg.summary.command.is_empty() {
