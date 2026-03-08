@@ -296,6 +296,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_observer_detects_amend() {
+        let dir = init_test_repo();
+        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+
+        cmd_tx
+            .send(GitObserverCommand::TrackRepo {
+                repo_path: dir.path().to_path_buf(),
+                session_id: "obs-session".to_string(),
+            })
+            .await
+            .unwrap();
+        observer.process_commands().await;
+
+        // Make a commit, poll
+        std::fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "original"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        observer.poll_repos().await;
+
+        // Amend, poll again
+        std::fs::write(dir.path().join("file.txt"), "v2").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--amend", "-m", "amended"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        observer.poll_repos().await;
+
+        let events = store
+            .lock()
+            .await
+            .get_git_events_for_session("obs-session")
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        let amend_event = events.iter().find(|e| e.data["cause"] == "amend");
+        assert!(amend_event.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_observer_detects_reset() {
+        let dir = init_test_repo();
+        let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
+
+        cmd_tx
+            .send(GitObserverCommand::TrackRepo {
+                repo_path: dir.path().to_path_buf(),
+                session_id: "obs-session".to_string(),
+            })
+            .await
+            .unwrap();
+        observer.process_commands().await;
+
+        let initial_sha = read_repo_state(dir.path()).unwrap().head_sha;
+
+        // Make a commit, poll
+        std::fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "to-be-reset"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        observer.poll_repos().await;
+
+        // Reset back, poll
+        Command::new("git")
+            .args(["reset", "--hard", &initial_sha])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        observer.poll_repos().await;
+
+        let events = store
+            .lock()
+            .await
+            .get_git_events_for_session("obs-session")
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        let reset_event = events.iter().find(|e| e.data["cause"] == "reset");
+        assert!(reset_event.is_some());
+
+        // Reset should NOT create a commit_link (it's destructive, not a new commit)
+        let links = store
+            .lock()
+            .await
+            .get_commit_links_for_session("obs-session")
+            .unwrap();
+        // Only the first commit should have a link, not the reset
+        assert_eq!(links.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_observer_detects_new_commit() {
         let dir = init_test_repo();
         let (mut observer, cmd_tx, store) = setup_observer(dir.path()).await;
