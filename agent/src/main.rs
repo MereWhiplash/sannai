@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use sannai_agent::{api, comment, config, daemon, provenance, session, store, watcher};
+use sannai_agent::{api, comment, config, daemon, git, provenance, session, store, watcher};
 
 #[derive(Parser)]
 #[command(name = "sannai")]
@@ -286,19 +286,24 @@ async fn run_daemon() -> anyhow::Result<()> {
     // 5. Watcher -> Session Manager channel
     let (tx, rx) = mpsc::channel::<watcher::WatcherEvent>(100_000);
 
-    // 6. Session Manager
-    let session_mgr = Arc::new(Mutex::new(session::SessionManager::new(
+    // 6. Git Observer channel
+    let (git_cmd_tx, git_cmd_rx) = mpsc::channel::<git::observer::GitObserverCommand>(100);
+
+    // 7. Session Manager (with git observer channel)
+    let mut session_mgr_inner = session::SessionManager::new(
         store.clone(),
         10, // idle timeout in minutes
-    )));
+    );
+    session_mgr_inner.set_git_cmd_tx(git_cmd_tx);
+    let session_mgr = Arc::new(Mutex::new(session_mgr_inner));
 
-    // 7. API state
+    // 8. API state
     let api_state = api::AppState {
         store: store.clone(),
         session_manager: session_mgr.clone(),
     };
 
-    // 8. Spawn all tasks
+    // 9. Spawn all tasks
     let claude_dir = daemon::claude_projects_dir();
     let state_path = daemon::data_dir().join("watcher_state.json");
 
@@ -318,13 +323,20 @@ async fn run_daemon() -> anyhow::Result<()> {
         api::serve(api_state, api_cancel).await
     });
 
+    let git_cancel = cancel.clone();
+    let git_store = store.clone();
+    let git_handle = tokio::spawn(async move {
+        let mut observer = git::observer::GitObserver::new(git_store, git_cmd_rx);
+        observer.run(git_cancel).await
+    });
+
     tracing::info!(
         "sannai daemon started (PID {}, db={})",
         std::process::id(),
         db_path.display(),
     );
 
-    // 9. Wait for any task to complete (or cancellation)
+    // 10. Wait for any task to complete (or cancellation)
     tokio::select! {
         r = watcher_handle => {
             if let Err(e) = r? { tracing::error!("Watcher error: {}", e); }
@@ -335,9 +347,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         r = api_handle => {
             if let Err(e) = r? { tracing::error!("API server error: {}", e); }
         }
+        r = git_handle => {
+            if let Err(e) = r? { tracing::error!("Git observer error: {}", e); }
+        }
     }
 
-    // 10. Cleanup
+    // 11. Cleanup
     daemon::release_pidfile()?;
     tracing::info!("sannai daemon stopped");
 
