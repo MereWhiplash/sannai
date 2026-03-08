@@ -42,6 +42,23 @@ CREATE TABLE IF NOT EXISTS git_events (
     data TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS attributions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    commit_sha TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    hunk_start INTEGER NOT NULL,
+    hunk_end INTEGER NOT NULL,
+    event_id INTEGER REFERENCES events(id),
+    confidence REAL NOT NULL,
+    attribution_type TEXT NOT NULL,
+    method TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(commit_sha, file_path, hunk_start, hunk_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attributions_commit ON attributions(commit_sha);
+CREATE INDEX IF NOT EXISTS idx_attributions_session ON attributions(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_commits_sha ON commit_links(commit_sha);
@@ -70,6 +87,21 @@ pub struct Event {
     pub context_files: Option<serde_json::Value>,
     pub timestamp: DateTime<Utc>,
     pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attribution {
+    pub id: Option<i64>,
+    pub commit_sha: String,
+    pub session_id: String,
+    pub file_path: String,
+    pub hunk_start: i32,
+    pub hunk_end: i32,
+    pub event_id: Option<i64>,
+    pub confidence: f32,
+    pub attribution_type: String,
+    pub method: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +370,61 @@ impl Store {
             events.push(row?);
         }
         Ok(events)
+    }
+
+    // --- Attributions ---
+
+    pub fn insert_attribution(&self, attr: &Attribution) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO attributions (commit_sha, session_id, file_path, hunk_start, hunk_end, event_id, confidence, attribution_type, method, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(commit_sha, file_path, hunk_start, hunk_end) DO UPDATE SET
+                confidence = excluded.confidence,
+                method = excluded.method,
+                event_id = excluded.event_id",
+            params![
+                attr.commit_sha,
+                attr.session_id,
+                attr.file_path,
+                attr.hunk_start,
+                attr.hunk_end,
+                attr.event_id,
+                attr.confidence,
+                attr.attribution_type,
+                attr.method,
+                attr.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_attributions_for_commit(&self, sha: &str) -> Result<Vec<Attribution>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, commit_sha, session_id, file_path, hunk_start, hunk_end, event_id, confidence, attribution_type, method, created_at
+             FROM attributions WHERE commit_sha = ?1 ORDER BY file_path, hunk_start",
+        )?;
+
+        let rows = stmt.query_map(params![sha], |row| {
+            Ok(Attribution {
+                id: Some(row.get(0)?),
+                commit_sha: row.get(1)?,
+                session_id: row.get(2)?,
+                file_path: row.get(3)?,
+                hunk_start: row.get(4)?,
+                hunk_end: row.get(5)?,
+                event_id: row.get(6)?,
+                confidence: row.get(7)?,
+                attribution_type: row.get(8)?,
+                method: row.get(9)?,
+                created_at: parse_datetime(row.get::<_, String>(10)?),
+            })
+        })?;
+
+        let mut attrs = Vec::new();
+        for row in rows {
+            attrs.push(row?);
+        }
+        Ok(attrs)
     }
 
     pub fn get_active_sessions(&self) -> Result<Vec<Session>> {
@@ -661,6 +748,89 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "head_changed");
         assert_eq!(events[0].data["new_sha"], "bbb222");
+    }
+
+    #[test]
+    fn test_insert_and_get_attributions() {
+        let (store, _dir) = test_store();
+        let now = Utc::now();
+
+        store
+            .upsert_session(&Session {
+                id: "attr-session".to_string(),
+                tool: "claude_code".to_string(),
+                project_path: Some("/test/repo".to_string()),
+                started_at: now,
+                ended_at: None,
+                synced_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        let attr = Attribution {
+            id: None,
+            commit_sha: "abc123".to_string(),
+            session_id: "attr-session".to_string(),
+            file_path: "src/main.rs".to_string(),
+            hunk_start: 10,
+            hunk_end: 15,
+            event_id: None,
+            confidence: 0.95,
+            attribution_type: "ai_generated".to_string(),
+            method: "content_match".to_string(),
+            created_at: now,
+        };
+
+        store.insert_attribution(&attr).unwrap();
+
+        let attrs = store.get_attributions_for_commit("abc123").unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].file_path, "src/main.rs");
+        assert!((attrs[0].confidence - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_attribution_uniqueness() {
+        let (store, _dir) = test_store();
+        let now = Utc::now();
+
+        store
+            .upsert_session(&Session {
+                id: "unique-session".to_string(),
+                tool: "claude_code".to_string(),
+                project_path: None,
+                started_at: now,
+                ended_at: None,
+                synced_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        let attr = Attribution {
+            id: None,
+            commit_sha: "abc123".to_string(),
+            session_id: "unique-session".to_string(),
+            file_path: "src/main.rs".to_string(),
+            hunk_start: 10,
+            hunk_end: 15,
+            event_id: None,
+            confidence: 0.8,
+            attribution_type: "ai_generated".to_string(),
+            method: "content_match".to_string(),
+            created_at: now,
+        };
+
+        store.insert_attribution(&attr).unwrap();
+        // Second insert with same unique key should upsert (update confidence)
+        let attr2 = Attribution {
+            confidence: 0.95,
+            ..attr
+        };
+        store.insert_attribution(&attr2).unwrap();
+
+        let attrs = store.get_attributions_for_commit("abc123").unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert!((attrs[0].confidence - 0.95).abs() < f32::EPSILON);
     }
 
     #[test]
