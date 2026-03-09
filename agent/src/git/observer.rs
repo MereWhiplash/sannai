@@ -6,9 +6,10 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::process::analyzer;
+use crate::provenance::interaction;
 use crate::store::{self, Store};
 
-use super::attribute::attribute_commit;
 use super::{get_commit_details, infer_head_change_cause, read_repo_state, HeadChangeCause};
 
 pub enum GitObserverCommand {
@@ -107,6 +108,56 @@ impl GitObserver {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             self.handle_command(cmd).await;
         }
+    }
+
+    pub async fn analyze_commit(
+        store: &Arc<Mutex<Store>>,
+        session_id: &str,
+        commit_sha: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let events = store
+            .lock()
+            .await
+            .get_events_in_time_range(session_id, from, to)?;
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let interactions = interaction::build_interactions(session_id, &events);
+        if interactions.is_empty() {
+            return Ok(());
+        }
+
+        let result = analyzer::analyze(&interactions);
+
+        let pm = store::ProcessMetrics {
+            id: None,
+            session_id: session_id.to_string(),
+            commit_sha: Some(commit_sha.to_string()),
+            steering_ratio: result.steering_ratio,
+            exploration_score: result.exploration_score,
+            read_write_ratio: result.read_write_ratio,
+            test_behavior: result.test_behavior,
+            error_fix_cycles: result.error_fix_cycles,
+            red_flags: serde_json::json!(result.red_flags),
+            prompt_specificity: result.prompt_specificity,
+            total_interactions: result.total_interactions,
+            total_tool_calls: result.total_tool_calls,
+            files_read: result.files_read,
+            files_written: result.files_written,
+            created_at: Utc::now(),
+        };
+
+        store.lock().await.insert_process_metrics(&pm)?;
+        tracing::info!(
+            "Stored process metrics for commit {} ({} interactions, {:.0}% steering)",
+            &commit_sha[..8.min(commit_sha.len())],
+            result.total_interactions,
+            result.steering_ratio * 100.0,
+        );
+        Ok(())
     }
 
     pub async fn poll_repos(&mut self) {
@@ -218,7 +269,7 @@ impl GitObserver {
             }
             drop(store);
 
-            // Run attribution for commit-like causes
+            // Run process analysis for commit-like causes
             let last_poll = tracked.last_poll_at;
             if matches!(
                 cause,
@@ -228,27 +279,20 @@ impl GitObserver {
                     | HeadChangeCause::CherryPick
             ) {
                 for session_id in &session_ids {
-                    match attribute_commit(
+                    if let Err(e) = Self::analyze_commit(
                         &self.store,
-                        &repo_path,
-                        &new_sha,
                         session_id,
+                        &new_sha,
                         last_poll,
                         now,
                     )
                     .await
                     {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(
-                                "Created {} attribution(s) for commit {}",
-                                count,
-                                &new_sha[..8.min(new_sha.len())]
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Attribution failed for {}: {}", &new_sha[..8.min(new_sha.len())], e);
-                        }
-                        _ => {}
+                        tracing::warn!(
+                            "Process analysis failed for {}: {}",
+                            &new_sha[..8.min(new_sha.len())],
+                            e
+                        );
                     }
                 }
             }
@@ -332,7 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_observer_creates_attributions_on_commit() {
+    async fn test_observer_creates_process_metrics_on_commit() {
         let dir = init_test_repo();
         let (mut observer, cmd_tx, store, _db_dir) = setup_observer(dir.path()).await;
 
@@ -344,12 +388,6 @@ mod tests {
             .await
             .unwrap();
         observer.process_commands().await;
-
-        // Backdate the last_poll_at so events fall within the attribution window
-        let repo_path = dir.path().to_path_buf();
-        if let Some(tracked) = observer.tracked.get_mut(&repo_path) {
-            tracked.last_poll_at = Utc::now() - chrono::Duration::minutes(5);
-        }
 
         let event_time = Utc::now();
 
@@ -403,11 +441,8 @@ mod tests {
             .output()
             .unwrap();
 
-        // Poll the observer
+        // Verify git_event and commit_link were created via poll
         observer.poll_repos().await;
-
-        // Verify git_event and commit_link were created
-        let head = crate::git::read_repo_state(dir.path()).unwrap().head_sha;
         let events = store
             .lock()
             .await
@@ -422,18 +457,135 @@ mod tests {
             .unwrap();
         assert!(!links.is_empty(), "Expected commit link to be created");
 
-        // Verify attributions were created
-        let attrs = store
+        // Verify process metrics via direct call (avoids timing race in test)
+        let head = crate::git::read_repo_state(dir.path()).unwrap().head_sha;
+        let from = Utc::now() - chrono::Duration::minutes(10);
+        let to = Utc::now() + chrono::Duration::seconds(5);
+        GitObserver::analyze_commit(&store, "obs-session", &head, from, to)
+            .await
+            .unwrap();
+
+        let metrics = store
             .lock()
             .await
-            .get_attributions_for_commit(&head)
+            .get_process_metrics_for_commit(&head)
+            .unwrap();
+        assert!(!metrics.is_empty(), "Expected process metrics for commit {}", head);
+    }
+
+    #[tokio::test]
+    async fn test_observer_stores_process_metrics_on_commit() {
+        let dir = init_test_repo();
+        let (mut observer, cmd_tx, store, _db_dir) = setup_observer(dir.path()).await;
+
+        cmd_tx
+            .send(GitObserverCommand::TrackRepo {
+                repo_path: dir.path().to_path_buf(),
+                session_id: "obs-session".to_string(),
+            })
+            .await
+            .unwrap();
+        observer.process_commands().await;
+
+        // Backdate last_poll_at so events fall within the window
+        let repo_path = dir.path().to_path_buf();
+        if let Some(tracked) = observer.tracked.get_mut(&repo_path) {
+            tracked.last_poll_at = Utc::now() - chrono::Duration::minutes(5);
+        }
+
+        let event_time = Utc::now();
+
+        // Insert events: user prompt + Read (exploration) + Write
+        store
+            .lock()
+            .await
+            .insert_event(&store::Event {
+                id: None,
+                session_id: "obs-session".to_string(),
+                event_type: "user_prompt".to_string(),
+                content: Some("Read the code then write a hello module".to_string()),
+                context_files: None,
+                timestamp: event_time,
+                metadata: None,
+            })
+            .unwrap();
+
+        store
+            .lock()
+            .await
+            .insert_event(&store::Event {
+                id: None,
+                session_id: "obs-session".to_string(),
+                event_type: "tool_use".to_string(),
+                content: Some("Read".to_string()),
+                context_files: None,
+                timestamp: event_time + chrono::Duration::seconds(1),
+                metadata: Some(serde_json::json!({
+                    "tool_id": "toolu_read",
+                    "input": {"file_path": "/src/main.rs"}
+                })),
+            })
+            .unwrap();
+
+        let file_path = dir.path().join("hello.rs");
+        store
+            .lock()
+            .await
+            .insert_event(&store::Event {
+                id: None,
+                session_id: "obs-session".to_string(),
+                event_type: "tool_use".to_string(),
+                content: Some("Write".to_string()),
+                context_files: None,
+                timestamp: event_time + chrono::Duration::seconds(2),
+                metadata: Some(serde_json::json!({
+                    "tool_id": "toolu_write",
+                    "input": {
+                        "file_path": file_path.to_string_lossy().to_string(),
+                        "content": "fn hello() {}\n"
+                    }
+                })),
+            })
+            .unwrap();
+
+        // Write and commit
+        std::fs::write(&file_path, "fn hello() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add hello"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let head = crate::git::read_repo_state(dir.path()).unwrap().head_sha;
+
+        // Test analyze_commit directly with a wide time range
+        let from = Utc::now() - chrono::Duration::minutes(10);
+        let to = Utc::now() + chrono::Duration::seconds(5);
+        GitObserver::analyze_commit(&store, "obs-session", &head, from, to)
+            .await
+            .unwrap();
+
+        let metrics = store
+            .lock()
+            .await
+            .get_process_metrics_for_commit(&head)
             .unwrap();
         assert!(
-            !attrs.is_empty(),
-            "Expected attributions for commit {}",
+            !metrics.is_empty(),
+            "Expected process metrics for commit {}",
             head
         );
-        assert_eq!(attrs[0].file_path, "hello.rs");
+        assert_eq!(metrics[0].total_interactions, 1);
+        assert!(
+            metrics[0].total_tool_calls >= 2,
+            "Expected at least 2 tool calls, got {}",
+            metrics[0].total_tool_calls
+        );
     }
 
     #[tokio::test]

@@ -219,20 +219,30 @@ async fn test_full_git_provenance_pipeline() {
     assert_eq!(linked_sessions.len(), 1);
     assert_eq!(linked_sessions[0].id, session_id);
 
-    // Attributions stored
-    let attrs = s.get_attributions_for_commit(&head_sha).unwrap();
-    assert!(!attrs.is_empty(), "Expected attributions for commit");
-    assert_eq!(attrs[0].file_path, "src/fib.rs");
-    assert_eq!(attrs[0].session_id, session_id);
+    drop(s);
 
-    // Debug: print attribution details
-    for attr in &attrs {
-        println!(
-            "  Attribution: {} hunk {}..{} confidence={:.3} type={} method={}",
-            attr.file_path, attr.hunk_start, attr.hunk_end, attr.confidence,
-            attr.attribution_type, attr.method
-        );
-    }
+    // Verify process analysis works on the session's events
+    use sannai_agent::process::analyzer;
+    use sannai_agent::provenance::interaction;
+
+    let all_events = store.lock().await.get_events_for_session(session_id).unwrap();
+    let interactions = interaction::build_interactions(session_id, &all_events);
+    assert_eq!(interactions.len(), 1, "Expected 1 interaction");
+    assert!(
+        !interactions[0].tool_calls.is_empty(),
+        "Expected tool calls in interaction"
+    );
+
+    let result = analyzer::analyze(&interactions);
+    assert_eq!(result.total_interactions, 1);
+    assert!(result.total_tool_calls >= 1, "Analyzer should find tool calls");
+    assert_eq!(result.files_written, 1);
+
+    // Also verify process_metrics were stored by observer (poll_repos)
+    let s = store.lock().await;
+    let metrics = s.get_process_metrics_for_commit(&head_sha).unwrap();
+    assert!(!metrics.is_empty(), "Expected process metrics from observer poll");
+    assert_eq!(metrics[0].session_id, session_id);
 
     println!("=== Full Git Provenance Pipeline Test Passed ===");
     println!("  Session: {}", session_id);
@@ -240,9 +250,11 @@ async fn test_full_git_provenance_pipeline() {
     println!("  Git events: {}", git_events.len());
     println!("  Commit links: {}", links.len());
     println!("  Commit SHA: {}", &head_sha[..8]);
-    println!("  Attributions: {}", attrs.len());
+    println!("  Process metrics: {} entries", metrics.len());
     println!(
-        "  Attribution: {} -> {} (confidence: {:.2})",
-        attrs[0].file_path, attrs[0].attribution_type, attrs[0].confidence
+        "  Steering: {:.0}%, Exploration: {:.2}, Test behavior: {}",
+        metrics[0].steering_ratio * 100.0,
+        metrics[0].exploration_score,
+        metrics[0].test_behavior
     );
 }
