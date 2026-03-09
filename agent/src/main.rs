@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use sannai_agent::{api, comment, config, daemon, git, provenance, session, store, watcher};
+use sannai_agent::{api, comment, daemon, git, session, store, watcher};
 
 #[derive(Parser)]
 #[command(name = "sannai")]
@@ -112,10 +112,7 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| ".".to_string())
         });
 
-    // 1. Load config
-    let cfg = config::load_config();
-
-    // 2. Get PR commit SHAs
+    // 1. Get PR commit SHAs
     println!("Fetching PR commits...");
     let commit_shas = comment::github::get_pr_commits(pr_url)?;
     if commit_shas.is_empty() {
@@ -124,30 +121,30 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
     }
     println!("Found {} commit(s)", commit_shas.len());
 
-    // 3. Open store and find linked sessions
+    // 2. Open store and find linked sessions
     let db_path = daemon::data_dir().join("store.db");
     if !db_path.exists() {
         anyhow::bail!("No Sannai database found. Has the agent been running?");
     }
-    let store = store::Store::open(&db_path)?;
+    let s = store::Store::open(&db_path)?;
 
     let mut session_ids = HashSet::new();
     for sha in &commit_shas {
-        for s in store.get_sessions_for_commit(sha)? {
-            session_ids.insert(s.id);
+        for sess in s.get_sessions_for_commit(sha)? {
+            session_ids.insert(sess.id);
         }
     }
 
     // Fallback: match sessions by repo path
     if session_ids.is_empty() {
         println!("No commit-linked sessions found, trying project path matching...");
-        for session in store.list_sessions(100, 0)? {
-            if let Some(proj) = &session.project_path {
+        for sess in s.list_sessions(100, 0)? {
+            if let Some(proj) = &sess.project_path {
                 if proj == &repo_path
                     || repo_path.ends_with(proj)
                     || proj.ends_with(&repo_path)
                 {
-                    session_ids.insert(session.id);
+                    session_ids.insert(sess.id);
                 }
             }
         }
@@ -161,123 +158,79 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
 
     println!("Found {} session(s) with provenance data", session_ids.len());
 
-    // 4. Build interactions and lineage per session
-    let mut all_interactions = Vec::new();
-    let mut all_lineage = Vec::new();
-    let mut session_summaries = Vec::new();
+    // 3. Aggregate process metrics across sessions and commits
+    let mut total_interactions: i32 = 0;
+    let mut total_steering: f64 = 0.0;
+    let mut total_exploration: f64 = 0.0;
+    let mut total_specificity: f64 = 0.0;
+    let mut total_error_cycles: i32 = 0;
+    let mut total_files_read: i32 = 0;
+    let mut total_files_written: i32 = 0;
+    let mut all_red_flags: Vec<String> = Vec::new();
+    let mut test_behaviors: Vec<String> = Vec::new();
+    let mut metrics_count: usize = 0;
 
     for session_id in &session_ids {
-        let events = store.get_events_for_session(session_id)?;
-        let interactions =
-            provenance::interaction::build_interactions(session_id, &events);
-
-        let mut session_lineage = Vec::new();
-        for interaction in &interactions {
-            session_lineage.extend(provenance::lineage::build_lineage(interaction));
-        }
-
-        let duration = if let (Some(first), Some(last)) =
-            (interactions.first(), interactions.last())
-        {
-            format_duration(last.timestamp_end - first.timestamp_start)
-        } else {
-            "0m".to_string()
-        };
-
-        session_summaries.push(comment::format::SessionSummary {
-            session_id: session_id.clone(),
-            interactions: interactions.clone(),
-            lineage: session_lineage.clone(),
-            duration,
-        });
-
-        all_interactions.extend(interactions);
-        all_lineage.extend(session_lineage);
-    }
-
-    // 5. Diff attribution — prefer stored attributions, fall back to on-the-fly
-    println!("Computing diff attribution...");
-    let mut all_attributions = Vec::new();
-    let mut has_stored = false;
-
-    for sha in &commit_shas {
-        let stored = store.get_attributions_for_commit(sha)?;
-        if !stored.is_empty() {
-            has_stored = true;
-            for attr in stored {
-                all_attributions.push(provenance::attribution::DiffAttribution {
-                    commit_sha: attr.commit_sha,
-                    file_path: attr.file_path,
-                    hunk_start: attr.hunk_start as u32,
-                    hunk_end: attr.hunk_end as u32,
-                    interaction_id: None,
-                    confidence: attr.confidence,
-                    attribution_type: match attr.attribution_type.as_str() {
-                        "AI-generated" => provenance::attribution::AttributionType::AiGenerated,
-                        "AI-assisted" => provenance::attribution::AttributionType::AiAssisted,
-                        "Manual" => provenance::attribution::AttributionType::Manual,
-                        _ => provenance::attribution::AttributionType::Unknown,
-                    },
-                });
+        let metrics = s.get_process_metrics_for_session(session_id)?;
+        for pm in &metrics {
+            metrics_count += 1;
+            total_interactions += pm.total_interactions;
+            total_steering += pm.steering_ratio;
+            total_exploration += pm.exploration_score;
+            total_specificity += pm.prompt_specificity;
+            total_error_cycles += pm.error_fix_cycles;
+            total_files_read += pm.files_read;
+            total_files_written += pm.files_written;
+            test_behaviors.push(pm.test_behavior.clone());
+            if let Some(flags) = pm.red_flags.as_array() {
+                for flag in flags {
+                    if let Some(f) = flag.as_str() {
+                        if !all_red_flags.contains(&f.to_string()) {
+                            all_red_flags.push(f.to_string());
+                        }
+                    }
+                }
             }
         }
     }
 
-    let pr_diff = comment::github::get_pr_diff(pr_url).unwrap_or_default();
-    if !has_stored {
-        println!("No stored attributions found, computing on-the-fly...");
-        all_attributions =
-            provenance::attribution::attribute_diff_text(&pr_diff, &all_interactions);
-    } else {
-        println!("Using {} stored attribution(s)", all_attributions.len());
+    if metrics_count == 0 {
+        println!("No process metrics found. The agent may not have captured commit-time analysis.");
+        return Ok(());
     }
 
-    // 6. LLM summary (optional)
-    let llm_summary = if cfg.summary.enabled && !cfg.summary.command.is_empty() {
-        println!("Generating LLM summary...");
-        let bundle = provenance::summary::ProvenanceBundle {
-            interactions: all_interactions,
-            lineage: all_lineage,
-            attributions: all_attributions.clone(),
-            diff: pr_diff,
-        };
-        let summary_config = provenance::summary::SummaryConfig {
-            enabled: cfg.summary.enabled,
-            command: cfg.summary.command,
-            max_length: cfg.summary.max_length,
-        };
-        provenance::summary::generate_summary(&bundle, &summary_config)
+    // Determine dominant test behavior
+    let test_behavior = if test_behaviors.iter().any(|t| t == "tdd") {
+        "tdd".to_string()
+    } else if test_behaviors.iter().any(|t| t == "test_after") {
+        "test_after".to_string()
+    } else if test_behaviors.iter().any(|t| t == "test_only") {
+        "test_only".to_string()
     } else {
-        None
+        "no_tests".to_string()
     };
 
-    // 7. Format comment
-    let comment_data = comment::format::CommentData {
-        sessions: session_summaries,
-        attributions: all_attributions,
-        llm_summary,
+    // 4. Format process audit comment
+    let audit_data = comment::format::ProcessAuditData {
+        session_count: session_ids.len() as i32,
+        total_interactions,
+        steering_ratio: total_steering / metrics_count as f64,
+        exploration_score: total_exploration / metrics_count as f64,
+        test_behavior,
+        error_fix_cycles: total_error_cycles,
+        red_flags: all_red_flags,
+        prompt_specificity: total_specificity / metrics_count as f64,
+        files_read: total_files_read,
+        files_written: total_files_written,
     };
-    let comment_body = comment::format::format_comment(&comment_data);
+    let comment_body = comment::format::format_process_audit(&audit_data);
 
-    // 8. Post to GitHub
-    println!("Posting comment to PR...");
+    // 5. Post to GitHub
+    println!("Posting process audit comment to PR...");
     comment::github::post_pr_comment(pr_url, &comment_body)?;
-    println!("Done! Provenance comment posted.");
+    println!("Done! Process audit comment posted.");
 
     Ok(())
-}
-
-fn format_duration(dur: chrono::Duration) -> String {
-    let total_seconds = dur.num_seconds();
-    if total_seconds < 60 {
-        format!("{}s", total_seconds)
-    } else if total_seconds < 3600 {
-        format!("{}m", total_seconds / 60)
-    } else {
-        let hours = total_seconds / 3600;
-        let minutes = (total_seconds % 3600) / 60;
-        format!("{}h {}m", hours, minutes)
-    }
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
