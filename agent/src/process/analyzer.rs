@@ -32,7 +32,7 @@ pub fn analyze(interactions: &[Interaction]) -> ProcessMetricsResult {
         read_write_ratio,
         test_behavior: detect_test_behavior(interactions),
         error_fix_cycles: count_error_fix_cycles(interactions),
-        red_flags: vec![],
+        red_flags: detect_red_flags(interactions),
         prompt_specificity: 0.0,
         total_interactions: interactions.len() as i32,
         total_tool_calls: interactions
@@ -131,6 +131,38 @@ fn detect_test_behavior(interactions: &[Interaction]) -> String {
         (Some(_), None) => "test_only".to_string(),
         _ => "no_tests".to_string(),
     }
+}
+
+fn detect_red_flags(interactions: &[Interaction]) -> Vec<String> {
+    let mut flags = Vec::new();
+
+    for interaction in interactions {
+        for tc in &interaction.tool_calls {
+            if tc.tool_name != "Bash" {
+                continue;
+            }
+            let cmd = match tc.input.get("command").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if cmd.contains("--force") && cmd.contains("git push") {
+                flags.push("Detected: force push".to_string());
+            }
+            if cmd.contains("--no-verify") {
+                flags.push("Detected: --no-verify (skipped hooks)".to_string());
+            }
+            if cmd.contains("reset --hard") {
+                flags.push("Detected: reset --hard".to_string());
+            }
+            if cmd.contains("rm -rf") {
+                flags.push("Detected: rm -rf".to_string());
+            }
+        }
+    }
+
+    flags.dedup();
+    flags
 }
 
 fn count_error_fix_cycles(interactions: &[Interaction]) -> i32 {
@@ -440,6 +472,91 @@ mod tests {
         )];
         let metrics = analyze(&interactions);
         assert_eq!(metrics.error_fix_cycles, 0);
+    }
+
+    #[test]
+    fn test_red_flags_force_push() {
+        let now = Utc::now();
+        let interactions = vec![make_interaction(
+            1,
+            "Push it",
+            vec![make_tool_call(
+                "Bash",
+                serde_json::json!({"command": "git push --force origin main"}),
+                now,
+                1,
+            )],
+        )];
+        let metrics = analyze(&interactions);
+        assert!(metrics.red_flags.iter().any(|f| f.contains("force push")));
+    }
+
+    #[test]
+    fn test_red_flags_no_verify() {
+        let now = Utc::now();
+        let interactions = vec![make_interaction(
+            1,
+            "Commit",
+            vec![make_tool_call(
+                "Bash",
+                serde_json::json!({"command": "git commit --no-verify -m 'wip'"}),
+                now,
+                1,
+            )],
+        )];
+        let metrics = analyze(&interactions);
+        assert!(metrics.red_flags.iter().any(|f| f.contains("--no-verify")));
+    }
+
+    #[test]
+    fn test_red_flags_reset_hard() {
+        let now = Utc::now();
+        let interactions = vec![make_interaction(
+            1,
+            "Reset",
+            vec![make_tool_call(
+                "Bash",
+                serde_json::json!({"command": "git reset --hard HEAD~3"}),
+                now,
+                1,
+            )],
+        )];
+        let metrics = analyze(&interactions);
+        assert!(metrics
+            .red_flags
+            .iter()
+            .any(|f| f.contains("reset --hard")));
+    }
+
+    #[test]
+    fn test_no_red_flags() {
+        let now = Utc::now();
+        let interactions = vec![make_interaction(
+            1,
+            "Normal work",
+            vec![
+                make_tool_call(
+                    "Read",
+                    serde_json::json!({"file_path": "/src/main.rs"}),
+                    now,
+                    1,
+                ),
+                make_tool_call(
+                    "Edit",
+                    serde_json::json!({"file_path": "/src/main.rs"}),
+                    now,
+                    2,
+                ),
+                make_tool_call(
+                    "Bash",
+                    serde_json::json!({"command": "cargo test"}),
+                    now,
+                    3,
+                ),
+            ],
+        )];
+        let metrics = analyze(&interactions);
+        assert!(metrics.red_flags.is_empty());
     }
 
     #[test]
