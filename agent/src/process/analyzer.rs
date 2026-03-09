@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
-use crate::provenance::interaction::Interaction;
+use crate::provenance::interaction::{Interaction, ToolCall};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessMetricsResult {
@@ -17,11 +19,17 @@ pub struct ProcessMetricsResult {
     pub files_written: i32,
 }
 
+const EXPLORE_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
+const WRITE_TOOLS: &[&str] = &["Write", "Edit"];
+
 pub fn analyze(interactions: &[Interaction]) -> ProcessMetricsResult {
+    let (read_write_ratio, files_read, files_written) =
+        compute_read_write_ratio(interactions);
+
     ProcessMetricsResult {
         steering_ratio: compute_steering_ratio(interactions),
-        exploration_score: 0.0,
-        read_write_ratio: 0.0,
+        exploration_score: compute_exploration_score(interactions),
+        read_write_ratio,
         test_behavior: "unknown".to_string(),
         error_fix_cycles: 0,
         red_flags: vec![],
@@ -31,8 +39,8 @@ pub fn analyze(interactions: &[Interaction]) -> ProcessMetricsResult {
             .iter()
             .map(|i| i.tool_calls.len())
             .sum::<usize>() as i32,
-        files_read: 0,
-        files_written: 0,
+        files_read,
+        files_written,
     }
 }
 
@@ -46,11 +54,70 @@ fn compute_steering_ratio(interactions: &[Interaction]) -> f64 {
     1.0
 }
 
+fn compute_exploration_score(interactions: &[Interaction]) -> f64 {
+    let all_tools: Vec<&ToolCall> = interactions
+        .iter()
+        .flat_map(|i| i.tool_calls.iter())
+        .collect();
+
+    if all_tools.is_empty() {
+        return 0.0;
+    }
+
+    let first_write_idx = all_tools
+        .iter()
+        .position(|tc| WRITE_TOOLS.contains(&tc.tool_name.as_str()));
+
+    let explore_before_write = match first_write_idx {
+        Some(idx) => all_tools[..idx]
+            .iter()
+            .filter(|tc| EXPLORE_TOOLS.contains(&tc.tool_name.as_str()))
+            .count(),
+        None => all_tools
+            .iter()
+            .filter(|tc| EXPLORE_TOOLS.contains(&tc.tool_name.as_str()))
+            .count(),
+    };
+
+    // Normalize: 0 explore = 0.0, 5+ explore before write = 1.0
+    (explore_before_write as f64 / 5.0).min(1.0)
+}
+
+fn compute_read_write_ratio(interactions: &[Interaction]) -> (f64, i32, i32) {
+    let mut files_read = HashSet::new();
+    let mut files_written = HashSet::new();
+
+    for interaction in interactions {
+        for tc in &interaction.tool_calls {
+            let file_path = tc.input.get("file_path").and_then(|v| v.as_str());
+            match tc.tool_name.as_str() {
+                "Read" => {
+                    if let Some(fp) = file_path {
+                        files_read.insert(fp.to_string());
+                    }
+                }
+                "Write" | "Edit" => {
+                    if let Some(fp) = file_path {
+                        files_written.insert(fp.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let read_count = files_read.len() as i32;
+    let write_count = files_written.len().max(1) as i32;
+    let ratio = read_count as f64 / write_count as f64;
+
+    (ratio, read_count, write_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provenance::interaction::{Interaction, ToolCall};
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
 
     fn make_interaction(seq: u32, prompt: &str, tools: Vec<ToolCall>) -> Interaction {
         let now = Utc::now();
@@ -64,6 +131,85 @@ mod tests {
             timestamp_start: now + Duration::seconds(seq as i64 * 10),
             timestamp_end: now + Duration::seconds(seq as i64 * 10 + 5),
         }
+    }
+
+    fn make_tool_call(
+        name: &str,
+        input: serde_json::Value,
+        base: DateTime<Utc>,
+        seq: u32,
+    ) -> ToolCall {
+        ToolCall {
+            tool_name: name.to_string(),
+            tool_id: format!("toolu_{}", seq),
+            input,
+            output: None,
+            timestamp: base + Duration::seconds(seq as i64),
+            sequence: seq,
+        }
+    }
+
+    #[test]
+    fn test_exploration_score_reads_before_writes() {
+        let now = Utc::now();
+        let interactions = vec![
+            make_interaction(
+                1,
+                "Look at the codebase",
+                vec![
+                    make_tool_call(
+                        "Read",
+                        serde_json::json!({"file_path": "/src/a.rs"}),
+                        now,
+                        1,
+                    ),
+                    make_tool_call(
+                        "Read",
+                        serde_json::json!({"file_path": "/src/b.rs"}),
+                        now,
+                        2,
+                    ),
+                    make_tool_call(
+                        "Glob",
+                        serde_json::json!({"pattern": "**/*.rs"}),
+                        now,
+                        3,
+                    ),
+                ],
+            ),
+            make_interaction(
+                2,
+                "Now fix the bug",
+                vec![make_tool_call(
+                    "Edit",
+                    serde_json::json!({"file_path": "/src/a.rs"}),
+                    now,
+                    1,
+                )],
+            ),
+        ];
+        let metrics = analyze(&interactions);
+        assert!(metrics.exploration_score > 0.5);
+        assert!(metrics.read_write_ratio > 1.0);
+        assert_eq!(metrics.files_read, 2);
+        assert_eq!(metrics.files_written, 1);
+    }
+
+    #[test]
+    fn test_exploration_score_write_first() {
+        let now = Utc::now();
+        let interactions = vec![make_interaction(
+            1,
+            "Write a new file",
+            vec![make_tool_call(
+                "Write",
+                serde_json::json!({"file_path": "/src/new.rs", "content": "fn main() {}"}),
+                now,
+                1,
+            )],
+        )];
+        let metrics = analyze(&interactions);
+        assert!((metrics.exploration_score - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
