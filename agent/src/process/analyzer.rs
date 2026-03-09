@@ -117,7 +117,7 @@ fn detect_test_behavior(interactions: &[Interaction]) -> String {
         })
         .collect();
 
-    let has_test = all_tools.iter().any(|k| *k == "test");
+    let has_test = all_tools.contains(&"test");
     if !has_test {
         return "no_tests".to_string();
     }
