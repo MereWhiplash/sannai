@@ -30,7 +30,7 @@ pub fn analyze(interactions: &[Interaction]) -> ProcessMetricsResult {
         steering_ratio: compute_steering_ratio(interactions),
         exploration_score: compute_exploration_score(interactions),
         read_write_ratio,
-        test_behavior: "unknown".to_string(),
+        test_behavior: detect_test_behavior(interactions),
         error_fix_cycles: 0,
         red_flags: vec![],
         prompt_specificity: 0.0,
@@ -81,6 +81,56 @@ fn compute_exploration_score(interactions: &[Interaction]) -> f64 {
 
     // Normalize: 0 explore = 0.0, 5+ explore before write = 1.0
     (explore_before_write as f64 / 5.0).min(1.0)
+}
+
+const TEST_COMMANDS: &[&str] = &[
+    "cargo test",
+    "npm test",
+    "npx jest",
+    "pytest",
+    "go test",
+    "make test",
+    "yarn test",
+    "bun test",
+];
+
+fn detect_test_behavior(interactions: &[Interaction]) -> String {
+    let all_tools: Vec<&str> = interactions
+        .iter()
+        .flat_map(|i| i.tool_calls.iter())
+        .filter_map(|tc| {
+            let is_test = tc.tool_name == "Bash"
+                && tc
+                    .input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(|cmd| TEST_COMMANDS.iter().any(|t| cmd.contains(t)))
+                    .unwrap_or(false);
+            let is_write = WRITE_TOOLS.contains(&tc.tool_name.as_str());
+            if is_test {
+                Some("test")
+            } else if is_write {
+                Some("write")
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let has_test = all_tools.iter().any(|k| *k == "test");
+    if !has_test {
+        return "no_tests".to_string();
+    }
+
+    let first_test = all_tools.iter().position(|k| *k == "test");
+    let first_write = all_tools.iter().position(|k| *k == "write");
+
+    match (first_test, first_write) {
+        (Some(t), Some(w)) if t < w => "tdd".to_string(),
+        (Some(_), Some(_)) => "test_after".to_string(),
+        (Some(_), None) => "test_only".to_string(),
+        _ => "no_tests".to_string(),
+    }
 }
 
 fn compute_read_write_ratio(interactions: &[Interaction]) -> (f64, i32, i32) {
@@ -210,6 +260,91 @@ mod tests {
         )];
         let metrics = analyze(&interactions);
         assert!((metrics.exploration_score - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_detect_test_after_code() {
+        let now = Utc::now();
+        let interactions = vec![
+            make_interaction(
+                1,
+                "Add the feature",
+                vec![make_tool_call(
+                    "Write",
+                    serde_json::json!({"file_path": "/src/feature.rs"}),
+                    now,
+                    1,
+                )],
+            ),
+            make_interaction(
+                2,
+                "Add tests",
+                vec![make_tool_call(
+                    "Bash",
+                    serde_json::json!({"command": "cargo test"}),
+                    now,
+                    1,
+                )],
+            ),
+        ];
+        let metrics = analyze(&interactions);
+        assert_eq!(metrics.test_behavior, "test_after");
+    }
+
+    #[test]
+    fn test_detect_tdd() {
+        let now = Utc::now();
+        let interactions = vec![
+            make_interaction(
+                1,
+                "Write a failing test first",
+                vec![make_tool_call(
+                    "Bash",
+                    serde_json::json!({"command": "cargo test test_foo"}),
+                    now,
+                    1,
+                )],
+            ),
+            make_interaction(
+                2,
+                "Now implement",
+                vec![make_tool_call(
+                    "Write",
+                    serde_json::json!({"file_path": "/src/foo.rs"}),
+                    now,
+                    1,
+                )],
+            ),
+            make_interaction(
+                3,
+                "Run tests again",
+                vec![make_tool_call(
+                    "Bash",
+                    serde_json::json!({"command": "cargo test"}),
+                    now,
+                    1,
+                )],
+            ),
+        ];
+        let metrics = analyze(&interactions);
+        assert_eq!(metrics.test_behavior, "tdd");
+    }
+
+    #[test]
+    fn test_detect_no_tests() {
+        let now = Utc::now();
+        let interactions = vec![make_interaction(
+            1,
+            "Write code",
+            vec![make_tool_call(
+                "Write",
+                serde_json::json!({"file_path": "/src/main.rs"}),
+                now,
+                1,
+            )],
+        )];
+        let metrics = analyze(&interactions);
+        assert_eq!(metrics.test_behavior, "no_tests");
     }
 
     #[test]
