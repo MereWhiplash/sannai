@@ -33,7 +33,7 @@ pub fn analyze(interactions: &[Interaction]) -> ProcessMetricsResult {
         test_behavior: detect_test_behavior(interactions),
         error_fix_cycles: count_error_fix_cycles(interactions),
         red_flags: detect_red_flags(interactions),
-        prompt_specificity: 0.0,
+        prompt_specificity: compute_prompt_specificity(interactions),
         total_interactions: interactions.len() as i32,
         total_tool_calls: interactions
             .iter()
@@ -131,6 +131,49 @@ fn detect_test_behavior(interactions: &[Interaction]) -> String {
         (Some(_), None) => "test_only".to_string(),
         _ => "no_tests".to_string(),
     }
+}
+
+fn compute_prompt_specificity(interactions: &[Interaction]) -> f64 {
+    if interactions.is_empty() {
+        return 0.0;
+    }
+
+    let scores: Vec<f64> = interactions
+        .iter()
+        .map(|i| {
+            let prompt = &i.prompt;
+            let mut score = 0.0;
+
+            // Length factor: longer prompts tend to be more specific
+            let word_count = prompt.split_whitespace().count();
+            score += (word_count as f64 / 20.0).min(0.4);
+
+            // File path mentions
+            if prompt.contains('/')
+                || prompt.contains(".rs")
+                || prompt.contains(".ts")
+                || prompt.contains(".go")
+                || prompt.contains(".py")
+            {
+                score += 0.3;
+            }
+
+            // Constraint words (specific technical direction)
+            let constraint_words = [
+                "must", "should", "ensure", "max", "min", "retry", "timeout", "error", "test",
+                "validate", "return", "handle", "implement", "add", "remove",
+            ];
+            let constraint_count = constraint_words
+                .iter()
+                .filter(|w| prompt.to_lowercase().contains(**w))
+                .count();
+            score += (constraint_count as f64 / 5.0).min(0.3);
+
+            score.min(1.0)
+        })
+        .collect();
+
+    scores.iter().sum::<f64>() / scores.len() as f64
 }
 
 fn detect_red_flags(interactions: &[Interaction]) -> Vec<String> {
@@ -557,6 +600,34 @@ mod tests {
         )];
         let metrics = analyze(&interactions);
         assert!(metrics.red_flags.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_specificity_high() {
+        let interactions = vec![
+            make_interaction(
+                1,
+                "Add retry logic to agent/src/api/mod.rs with exponential backoff, max 3 retries, starting at 100ms",
+                vec![],
+            ),
+            make_interaction(
+                2,
+                "Write a test in agent/tests/api_retry.rs that verifies the backoff timing",
+                vec![],
+            ),
+        ];
+        let metrics = analyze(&interactions);
+        assert!(metrics.prompt_specificity > 0.5);
+    }
+
+    #[test]
+    fn test_prompt_specificity_low() {
+        let interactions = vec![
+            make_interaction(1, "fix it", vec![]),
+            make_interaction(2, "make it work", vec![]),
+        ];
+        let metrics = analyze(&interactions);
+        assert!(metrics.prompt_specificity < 0.3);
     }
 
     #[test]
