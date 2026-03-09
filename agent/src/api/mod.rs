@@ -38,7 +38,15 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/git-events", get(get_session_git_events))
         .route("/sessions/:id/commits", get(get_session_commits))
         .route("/sessions/:id/attributions", get(get_session_attributions))
+        .route(
+            "/sessions/:id/process-metrics",
+            get(get_session_process_metrics),
+        )
         .route("/commits/:sha/attributions", get(get_commit_attributions))
+        .route(
+            "/commits/:sha/process-metrics",
+            get(get_commit_process_metrics),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -293,4 +301,39 @@ async fn get_commit_attributions(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(attrs))
+}
+
+// --- GET /sessions/:id/process-metrics ---
+
+async fn get_session_process_metrics(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<store::ProcessMetrics>>, StatusCode> {
+    let store = state.store.lock().await;
+
+    store
+        .get_session(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let metrics = store
+        .get_process_metrics_for_session(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(metrics))
+}
+
+// --- GET /commits/:sha/process-metrics ---
+
+async fn get_commit_process_metrics(
+    State(state): State<AppState>,
+    Path(sha): Path<String>,
+) -> Result<Json<Vec<store::ProcessMetrics>>, StatusCode> {
+    let store = state.store.lock().await;
+
+    let metrics = store
+        .get_process_metrics_for_commit(&sha)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(metrics))
 }
