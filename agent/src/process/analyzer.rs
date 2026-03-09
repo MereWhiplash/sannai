@@ -31,7 +31,7 @@ pub fn analyze(interactions: &[Interaction]) -> ProcessMetricsResult {
         exploration_score: compute_exploration_score(interactions),
         read_write_ratio,
         test_behavior: detect_test_behavior(interactions),
-        error_fix_cycles: 0,
+        error_fix_cycles: count_error_fix_cycles(interactions),
         red_flags: vec![],
         prompt_specificity: 0.0,
         total_interactions: interactions.len() as i32,
@@ -131,6 +131,41 @@ fn detect_test_behavior(interactions: &[Interaction]) -> String {
         (Some(_), None) => "test_only".to_string(),
         _ => "no_tests".to_string(),
     }
+}
+
+fn count_error_fix_cycles(interactions: &[Interaction]) -> i32 {
+    let all_tools: Vec<&ToolCall> = interactions
+        .iter()
+        .flat_map(|i| i.tool_calls.iter())
+        .collect();
+
+    let mut cycles = 0;
+    for i in 0..all_tools.len() {
+        if all_tools[i].tool_name == "Bash" && is_error_output(all_tools[i]) {
+            let rest = &all_tools[i + 1..];
+            let has_fix = rest
+                .iter()
+                .any(|tc| WRITE_TOOLS.contains(&tc.tool_name.as_str()));
+            if has_fix {
+                cycles += 1;
+            }
+        }
+    }
+    cycles
+}
+
+fn is_error_output(tc: &ToolCall) -> bool {
+    tc.output
+        .as_ref()
+        .map(|o| {
+            let lower = o.to_lowercase();
+            lower.contains("error")
+                || lower.contains("failed")
+                || lower.contains("panic")
+                || lower.contains("exception")
+                || lower.contains("traceback")
+        })
+        .unwrap_or(false)
 }
 
 fn compute_read_write_ratio(interactions: &[Interaction]) -> (f64, i32, i32) {
@@ -345,6 +380,66 @@ mod tests {
         )];
         let metrics = analyze(&interactions);
         assert_eq!(metrics.test_behavior, "no_tests");
+    }
+
+    #[test]
+    fn test_error_fix_cycles() {
+        let now = Utc::now();
+        let interactions = vec![
+            make_interaction(
+                1,
+                "Build it",
+                vec![ToolCall {
+                    tool_name: "Bash".to_string(),
+                    tool_id: "t1".to_string(),
+                    input: serde_json::json!({"command": "cargo build"}),
+                    output: Some("error[E0308]: mismatched types".to_string()),
+                    timestamp: now,
+                    sequence: 1,
+                }],
+            ),
+            make_interaction(
+                2,
+                "Fix the error",
+                vec![
+                    make_tool_call(
+                        "Edit",
+                        serde_json::json!({"file_path": "/src/main.rs"}),
+                        now,
+                        1,
+                    ),
+                    ToolCall {
+                        tool_name: "Bash".to_string(),
+                        tool_id: "t2".to_string(),
+                        input: serde_json::json!({"command": "cargo build"}),
+                        output: Some("Compiling sannai v0.1.0".to_string()),
+                        timestamp: now,
+                        sequence: 2,
+                    },
+                ],
+            ),
+        ];
+        let metrics = analyze(&interactions);
+        assert_eq!(metrics.error_fix_cycles, 1);
+    }
+
+    #[test]
+    fn test_no_error_cycles() {
+        let now = Utc::now();
+        let interactions = vec![make_interaction(
+            1,
+            "Build",
+            vec![ToolCall {
+                tool_name: "Bash".to_string(),
+                tool_id: "t1".to_string(),
+                input: serde_json::json!({"command": "cargo build"}),
+                output: Some("Finished dev".to_string()),
+                timestamp: now,
+                sequence: 1,
+            }],
+        )];
+        let metrics = analyze(&interactions);
+        assert_eq!(metrics.error_fix_cycles, 0);
     }
 
     #[test]
