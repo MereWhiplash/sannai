@@ -110,7 +110,7 @@ fn find_existing_comment(owner_repo: &str, pr_number: &str) -> Result<Option<Str
             "api",
             &format!("repos/{}/issues/{}/comments", owner_repo, pr_number),
             "--jq",
-            r#".[] | select(.body | contains("Sannai Code Provenance")) | .id"#,
+            r#".[] | select(.body | contains("AI Process Audit")) | .id"#,
         ])
         .output()?;
 
