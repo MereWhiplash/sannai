@@ -62,6 +62,26 @@ CREATE TABLE IF NOT EXISTS attributions (
     UNIQUE(commit_sha, file_path, hunk_start, hunk_end)
 );
 
+CREATE TABLE IF NOT EXISTS process_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    commit_sha TEXT,
+    steering_ratio REAL NOT NULL,
+    exploration_score REAL NOT NULL,
+    read_write_ratio REAL NOT NULL,
+    test_behavior TEXT NOT NULL,
+    error_fix_cycles INTEGER NOT NULL,
+    red_flags TEXT NOT NULL,
+    prompt_specificity REAL NOT NULL,
+    total_interactions INTEGER NOT NULL,
+    total_tool_calls INTEGER NOT NULL,
+    files_read INTEGER NOT NULL,
+    files_written INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_process_metrics_session ON process_metrics(session_id);
+CREATE INDEX IF NOT EXISTS idx_process_metrics_commit ON process_metrics(commit_sha);
+
 CREATE INDEX IF NOT EXISTS idx_attributions_commit ON attributions(commit_sha);
 CREATE INDEX IF NOT EXISTS idx_attributions_session ON attributions(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
@@ -130,6 +150,25 @@ pub struct CommitLink {
     pub files_changed: Option<Vec<String>>,
     pub diff_stat: Option<serde_json::Value>,
     pub detection_method: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessMetrics {
+    pub id: Option<i64>,
+    pub session_id: String,
+    pub commit_sha: Option<String>,
+    pub steering_ratio: f64,
+    pub exploration_score: f64,
+    pub read_write_ratio: f64,
+    pub test_behavior: String,
+    pub error_fix_cycles: i32,
+    pub red_flags: serde_json::Value,
+    pub prompt_specificity: f64,
+    pub total_interactions: i32,
+    pub total_tool_calls: i32,
+    pub files_read: i32,
+    pub files_written: i32,
+    pub created_at: DateTime<Utc>,
 }
 
 pub struct Store {
@@ -540,6 +579,102 @@ impl Store {
             attrs.push(row?);
         }
         Ok(attrs)
+    }
+
+    // --- Process metrics ---
+
+    pub fn insert_process_metrics(&self, pm: &ProcessMetrics) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO process_metrics (session_id, commit_sha, steering_ratio, exploration_score, read_write_ratio, test_behavior, error_fix_cycles, red_flags, prompt_specificity, total_interactions, total_tool_calls, files_read, files_written, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                pm.session_id,
+                pm.commit_sha,
+                pm.steering_ratio,
+                pm.exploration_score,
+                pm.read_write_ratio,
+                pm.test_behavior,
+                pm.error_fix_cycles,
+                pm.red_flags.to_string(),
+                pm.prompt_specificity,
+                pm.total_interactions,
+                pm.total_tool_calls,
+                pm.files_read,
+                pm.files_written,
+                pm.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_process_metrics_for_session(&self, session_id: &str) -> Result<Vec<ProcessMetrics>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, commit_sha, steering_ratio, exploration_score, read_write_ratio, test_behavior, error_fix_cycles, red_flags, prompt_specificity, total_interactions, total_tool_calls, files_read, files_written, created_at
+             FROM process_metrics WHERE session_id = ?1 ORDER BY created_at ASC",
+        )?;
+
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(ProcessMetrics {
+                id: Some(row.get(0)?),
+                session_id: row.get(1)?,
+                commit_sha: row.get(2)?,
+                steering_ratio: row.get(3)?,
+                exploration_score: row.get(4)?,
+                read_write_ratio: row.get(5)?,
+                test_behavior: row.get(6)?,
+                error_fix_cycles: row.get(7)?,
+                red_flags: row
+                    .get::<_, String>(8)
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+                prompt_specificity: row.get(9)?,
+                total_interactions: row.get(10)?,
+                total_tool_calls: row.get(11)?,
+                files_read: row.get(12)?,
+                files_written: row.get(13)?,
+                created_at: parse_datetime(row.get::<_, String>(14)?),
+            })
+        })?;
+
+        let mut metrics = Vec::new();
+        for row in rows {
+            metrics.push(row?);
+        }
+        Ok(metrics)
+    }
+
+    pub fn get_process_metrics_for_commit(&self, sha: &str) -> Result<Vec<ProcessMetrics>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, commit_sha, steering_ratio, exploration_score, read_write_ratio, test_behavior, error_fix_cycles, red_flags, prompt_specificity, total_interactions, total_tool_calls, files_read, files_written, created_at
+             FROM process_metrics WHERE commit_sha = ?1 ORDER BY created_at ASC",
+        )?;
+
+        let rows = stmt.query_map(params![sha], |row| {
+            Ok(ProcessMetrics {
+                id: Some(row.get(0)?),
+                session_id: row.get(1)?,
+                commit_sha: row.get(2)?,
+                steering_ratio: row.get(3)?,
+                exploration_score: row.get(4)?,
+                read_write_ratio: row.get(5)?,
+                test_behavior: row.get(6)?,
+                error_fix_cycles: row.get(7)?,
+                red_flags: row
+                    .get::<_, String>(8)
+                    .map(|s| serde_json::from_str(&s).unwrap_or_default())?,
+                prompt_specificity: row.get(9)?,
+                total_interactions: row.get(10)?,
+                total_tool_calls: row.get(11)?,
+                files_read: row.get(12)?,
+                files_written: row.get(13)?,
+                created_at: parse_datetime(row.get::<_, String>(14)?),
+            })
+        })?;
+
+        let mut metrics = Vec::new();
+        for row in rows {
+            metrics.push(row?);
+        }
+        Ok(metrics)
     }
 
     pub fn get_active_sessions(&self) -> Result<Vec<Session>> {
@@ -1034,6 +1169,55 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].message.as_deref(), Some("feat: add auth"));
         assert_eq!(links[0].detection_method.as_deref(), Some("poll"));
+    }
+
+    #[test]
+    fn test_insert_and_get_process_metrics() {
+        let (store, _dir) = test_store();
+        let now = Utc::now();
+
+        store
+            .upsert_session(&Session {
+                id: "pm-session".to_string(),
+                tool: "claude_code".to_string(),
+                project_path: None,
+                started_at: now,
+                ended_at: None,
+                synced_at: None,
+                metadata: None,
+            })
+            .unwrap();
+
+        let pm = ProcessMetrics {
+            id: None,
+            session_id: "pm-session".to_string(),
+            commit_sha: Some("abc123".to_string()),
+            steering_ratio: 0.72,
+            exploration_score: 0.85,
+            read_write_ratio: 2.5,
+            test_behavior: "test_after".to_string(),
+            error_fix_cycles: 2,
+            red_flags: serde_json::json!([]),
+            prompt_specificity: 0.65,
+            total_interactions: 47,
+            total_tool_calls: 120,
+            files_read: 12,
+            files_written: 5,
+            created_at: now,
+        };
+
+        store.insert_process_metrics(&pm).unwrap();
+
+        let retrieved = store
+            .get_process_metrics_for_session("pm-session")
+            .unwrap();
+        assert_eq!(retrieved.len(), 1);
+        assert!((retrieved[0].steering_ratio - 0.72).abs() < f64::EPSILON);
+        assert_eq!(retrieved[0].test_behavior, "test_after");
+        assert_eq!(retrieved[0].total_interactions, 47);
+
+        let by_commit = store.get_process_metrics_for_commit("abc123").unwrap();
+        assert_eq!(by_commit.len(), 1);
     }
 
     #[test]
