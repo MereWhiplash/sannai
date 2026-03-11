@@ -286,6 +286,17 @@ impl SessionManager {
                             metadata: None,
                         };
                         self.store.lock().await.upsert_session(&session)?;
+
+                        // Now that we have the real cwd, track the git repo
+                        if let Some(ref git_tx) = self.git_cmd_tx {
+                            let path = std::path::Path::new(cwd);
+                            if let Some(repo_path) = git::discover_repo(path) {
+                                let _ = git_tx.try_send(GitObserverCommand::TrackRepo {
+                                    repo_path,
+                                    session_id: session_id.to_string(),
+                                });
+                            }
+                        }
                     }
                 }
             }

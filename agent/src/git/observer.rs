@@ -78,11 +78,24 @@ impl GitObserver {
                     }
                 } else if let Ok(state) = read_repo_state(&repo_path) {
                     tracing::info!("Tracking repo {} for session {}", repo_path.display(), session_id);
+                    // Use the session's start time so we capture events that
+                    // arrived before tracking began (e.g., when SessionStart
+                    // creates the session without cwd, then UserPrompt triggers
+                    // TrackRepo after events are already stored).
+                    let poll_start = self
+                        .store
+                        .lock()
+                        .await
+                        .get_session(&session_id)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.started_at)
+                        .unwrap_or_else(Utc::now);
                     self.tracked.insert(repo_path.clone(), TrackedRepo {
                         repo_path,
                         session_ids: vec![session_id],
                         last_head_sha: state.head_sha,
-                        last_poll_at: Utc::now(),
+                        last_poll_at: poll_start,
                     });
                 }
             }

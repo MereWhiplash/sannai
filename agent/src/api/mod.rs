@@ -50,10 +50,15 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Start the API server, runs until cancellation.
+/// Port can be overridden with SANNAI_API_PORT env var (default: 9847).
 pub async fn serve(state: AppState, cancel: CancellationToken) -> anyhow::Result<()> {
+    let port = std::env::var("SANNAI_API_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(9847);
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:9847").await?;
-    tracing::info!("Local API server listening on 127.0.0.1:9847");
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    tracing::info!("Local API server listening on 127.0.0.1:{}", port);
     axum::serve(listener, app)
         .with_graceful_shutdown(cancel.cancelled_owned())
         .await?;
