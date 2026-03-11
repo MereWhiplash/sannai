@@ -16,37 +16,33 @@ Sannai runs as a local daemon that:
 - **Links** git commits to the sessions that produced them
 - **Comments** on pull requests with session provenance summaries
 
-## Install
+## Quick start
+
+```bash
+cargo install sannai          # 1. Install the binary
+sannai install                # 2. Register as a login daemon
+```
+
+That's it. Sannai is now running in the background and will start automatically on login.
 
 ### From source
 
 ```bash
 git clone https://github.com/MereWhiplash/sannai.git
 cd sannai/agent
-cargo build --release
-# Binary at target/release/sannai
-```
-
-### Cargo
-
-```bash
-cargo install sannai
+cargo install --path .        # Installs to ~/.cargo/bin/sannai
+sannai install                # Register the daemon
 ```
 
 ## Usage
 
 ```bash
-# Start the daemon (foreground)
-sannai start
-
-# Check status
-sannai status
-
-# List captured sessions
-sannai sessions
-
-# Post a provenance comment on a PR
-sannai comment --pr <owner/repo#number>
+sannai status                 # Check daemon and service status
+sannai sessions               # List captured sessions
+sannai comment --pr <url>     # Post provenance comment on a PR
+sannai start                  # Start daemon in foreground (manual)
+sannai uninstall              # Remove the daemon service
+sannai uninstall --purge      # Remove service and all stored data
 ```
 
 The daemon runs a local API on `127.0.0.1:9847` with endpoints:
@@ -61,6 +57,7 @@ The daemon runs a local API on `127.0.0.1:9847` with endpoints:
 
 - Rust (stable)
 - Claude Code (generates the session files Sannai watches)
+- `gh` CLI (authenticated, for posting PR comments)
 
 ## Development
 
