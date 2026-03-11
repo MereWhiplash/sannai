@@ -1,0 +1,11 @@
+{
+  "name": "sannai",
+  "description": "AI code provenance — captures coding sessions and posts summaries on PRs",
+  "version": "0.1.0",
+  "author": {
+    "name": "MereWhiplash"
+  },
+  "repository": "https://github.com/MereWhiplash/sannai",
+  "license": "MIT",
+  "keywords": ["provenance", "code-review", "ai", "claude"]
+}
