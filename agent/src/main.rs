@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use sannai::{api, comment, config, daemon, provenance, session, store, watcher};
+use sannai::{api, comment, config, daemon, provenance, service, session, store, watcher};
 
 #[derive(Parser)]
 #[command(name = "sannai")]
@@ -32,6 +32,14 @@ enum Commands {
         /// Maximum number of sessions to display
         #[arg(long, default_value = "20")]
         limit: u32,
+    },
+    /// Install sannai as a system service (launchd on macOS, systemd on Linux)
+    Install,
+    /// Uninstall the sannai system service
+    Uninstall {
+        /// Also remove all stored data (sessions, database)
+        #[arg(long)]
+        purge: bool,
     },
     /// Post provenance comment on a GitHub PR
     Comment {
@@ -63,10 +71,36 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop => {
             daemon::stop_daemon()?;
         }
-        Commands::Status => match daemon::daemon_status() {
-            Some(pid) => println!("sannai daemon: running (PID {})", pid),
-            None => println!("sannai daemon: not running"),
-        },
+        Commands::Install => {
+            service::install_service()?;
+        }
+        Commands::Uninstall { purge } => {
+            service::uninstall_service(purge)?;
+        }
+        Commands::Status => {
+            match daemon::daemon_status() {
+                Some(pid) => println!("sannai daemon: running (PID {})", pid),
+                None => println!("sannai daemon: not running"),
+            }
+            println!(
+                "Service installed: {}",
+                if service::is_service_installed() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            let data_dir = daemon::data_dir();
+            println!("Data directory: {}", data_dir.display());
+            let db_path = data_dir.join("store.db");
+            if db_path.exists() {
+                if let Ok(s) = store::Store::open(&db_path) {
+                    if let Ok(sessions) = s.list_sessions(u32::MAX, 0) {
+                        println!("Sessions captured: {}", sessions.len());
+                    }
+                }
+            }
+        }
         Commands::Sessions { limit } => {
             let db_path = daemon::data_dir().join("store.db");
             if !db_path.exists() {
