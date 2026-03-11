@@ -1,6 +1,11 @@
 pub mod api;
+pub mod comment;
+pub mod config;
 pub mod daemon;
+pub mod git;
 pub mod parser;
+pub mod process;
+pub mod provenance;
 pub mod session;
 pub mod store;
 pub mod watcher;
