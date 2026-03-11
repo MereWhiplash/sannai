@@ -59,6 +59,10 @@ The daemon runs a local API on `127.0.0.1:9847` with endpoints:
 - Claude Code (generates the session files Sannai watches)
 - `gh` CLI (authenticated, for posting PR comments)
 
+## Claude Code skill
+
+Sannai includes a Claude Code skill at `skills/provenance/` that teaches Claude to post provenance comments after creating PRs. To use it, add this repo as a plugin source or copy the skill into your own plugin.
+
 ## Development
 
 ```bash
