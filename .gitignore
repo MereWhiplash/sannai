@@ -1,24 +1,13 @@
 # =========================
-# Sannai Monorepo .gitignore
+# Sannai .gitignore
 # =========================
 
 # --- Rust (agent/) ---
 agent/target/
 **/*.rs.bk
 
-# --- Go (api/) ---
-api/bin/
-api/vendor/
-
-# --- Node/React (web/) ---
-web/node_modules/
-web/dist/
-web/.output/
-web/.nitro/
-web/.tanstack/
-web/src/routeTree.gen.ts
-web/.next/
-web/.turbo/
+# --- Archive (not part of open-source release) ---
+_archive/
 
 # --- IDE ---
 .idea/
