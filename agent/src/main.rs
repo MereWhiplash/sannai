@@ -163,12 +163,28 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    // Fallback: match sessions by repo path
+    // Fallback: match sessions by repo path + time window
     if session_ids.is_empty() {
         println!("No commit-linked sessions found, trying project path matching...");
-        for session in store.list_sessions(100, 0)? {
+        let time_range = comment::github::get_pr_commit_time_range(pr_url)?;
+        for session in store.list_sessions(1000, 0)? {
             if let Some(proj) = &session.project_path {
-                if proj == &repo_path || repo_path.ends_with(proj) || proj.ends_with(&repo_path) {
+                let path_match =
+                    proj == &repo_path || repo_path.ends_with(proj) || proj.ends_with(&repo_path);
+                if !path_match {
+                    continue;
+                }
+                // Filter by time: session must overlap with PR commit window (with 2hr buffer)
+                if let Some((earliest, latest)) = &time_range {
+                    let buffer = chrono::Duration::hours(2);
+                    let window_start = *earliest - buffer;
+                    let window_end = *latest + buffer;
+                    let session_end = session.ended_at.unwrap_or(chrono::Utc::now());
+                    if session.started_at <= window_end && session_end >= window_start {
+                        session_ids.insert(session.id);
+                    }
+                } else {
+                    // No time range available, include all path matches
                     session_ids.insert(session.id);
                 }
             }

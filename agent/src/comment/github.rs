@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 
 /// Get commit SHAs for a PR using the `gh` CLI.
 pub fn get_pr_commits(pr_url: &str) -> Result<Vec<String>> {
@@ -31,6 +32,44 @@ pub fn get_pr_commits(pr_url: &str) -> Result<Vec<String>> {
         stdout.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
     Ok(shas)
+}
+
+/// Get the time range of commits in a PR (earliest, latest).
+/// Returns None if timestamps can't be parsed.
+pub fn get_pr_commit_time_range(pr_url: &str) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
+
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number,
+            "--repo",
+            &owner_repo,
+            "--json",
+            "commits",
+            "--jq",
+            ".commits[].committedDate",
+        ])
+        .output()
+        .context("Failed to run `gh` CLI")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut dates: Vec<DateTime<Utc>> = stdout
+        .lines()
+        .filter_map(|s| s.trim().parse::<DateTime<Utc>>().ok())
+        .collect();
+
+    if dates.is_empty() {
+        return Ok(None);
+    }
+
+    dates.sort();
+    Ok(Some((dates[0], dates[dates.len() - 1])))
 }
 
 /// Get the diff for a PR.
