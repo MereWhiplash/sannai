@@ -27,9 +27,8 @@ pub fn claude_projects_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SANNAI_CLAUDE_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .expect("Could not determine home directory");
+    let home =
+        std::env::var("HOME").map(PathBuf::from).expect("Could not determine home directory");
     home.join(".claude").join("projects")
 }
 
@@ -57,8 +56,7 @@ pub fn acquire_pidfile() -> Result<()> {
         fs::remove_file(&path)?;
     }
 
-    fs::write(&path, std::process::id().to_string())
-        .context("Failed to write PID file")?;
+    fs::write(&path, std::process::id().to_string()).context("Failed to write PID file")?;
 
     Ok(())
 }

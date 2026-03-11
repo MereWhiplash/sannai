@@ -17,11 +17,7 @@ pub struct SummaryConfig {
 
 impl Default for SummaryConfig {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            command: String::new(),
-            max_length: 500,
-        }
+        Self { enabled: false, command: String::new(), max_length: 500 }
     }
 }
 

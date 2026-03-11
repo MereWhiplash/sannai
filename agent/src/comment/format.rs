@@ -45,11 +45,7 @@ pub fn format_comment(data: &CommentData) -> String {
             "### Session: `{}` \u{2014} {} interaction{}, {}\n\n",
             short_id,
             session.interactions.len(),
-            if session.interactions.len() != 1 {
-                "s"
-            } else {
-                ""
-            },
+            if session.interactions.len() != 1 { "s" } else { "" },
             session.duration,
         ));
 
@@ -165,11 +161,7 @@ fn format_interaction_attribution(
 
     let best = attrs
         .iter()
-        .max_by(|a, b| {
-            a.confidence
-                .partial_cmp(&b.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap();
 
     let label = match best.attribution_type {
@@ -193,11 +185,7 @@ mod tests {
 
     #[test]
     fn test_format_empty_comment() {
-        let data = CommentData {
-            sessions: vec![],
-            attributions: vec![],
-            llm_summary: None,
-        };
+        let data = CommentData { sessions: vec![], attributions: vec![], llm_summary: None };
         let comment = format_comment(&data);
         assert!(comment.contains("Sannai Code Provenance"));
         assert!(comment.contains("0 AI sessions"));

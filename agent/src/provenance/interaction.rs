@@ -118,9 +118,7 @@ fn build_single_interaction(
 
                 // Match result to the corresponding tool call
                 if !tool_use_id.is_empty() {
-                    if let Some(tc) =
-                        tool_calls.iter_mut().find(|tc| tc.tool_id == tool_use_id)
-                    {
+                    if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.tool_id == tool_use_id) {
                         tc.output = event.content.clone();
                     }
                 }
@@ -129,10 +127,8 @@ fn build_single_interaction(
         }
     }
 
-    let timestamp_end = response_events
-        .last()
-        .map(|e| e.timestamp)
-        .unwrap_or(prompt_event.timestamp);
+    let timestamp_end =
+        response_events.last().map(|e| e.timestamp).unwrap_or(prompt_event.timestamp);
 
     Interaction {
         id: format!("{}-{}", session_id, sequence),
@@ -200,12 +196,7 @@ mod tests {
                 now + Duration::seconds(1),
                 None,
             ),
-            make_event(
-                "user_prompt",
-                Some("Second prompt"),
-                now + Duration::seconds(5),
-                None,
-            ),
+            make_event("user_prompt", Some("Second prompt"), now + Duration::seconds(5), None),
             make_event(
                 "assistant_response",
                 Some("Second response"),
@@ -263,12 +254,7 @@ mod tests {
         let now = Utc::now();
         let events = vec![
             // Events before any prompt should be ignored
-            make_event(
-                "assistant_response",
-                Some("Stray response"),
-                now,
-                None,
-            ),
+            make_event("assistant_response", Some("Stray response"), now, None),
             make_event("user_prompt", Some("Actual prompt"), now + Duration::seconds(5), None),
             make_event(
                 "assistant_response",

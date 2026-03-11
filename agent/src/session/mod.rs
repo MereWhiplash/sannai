@@ -94,28 +94,13 @@ impl SessionManager {
     }
 
     async fn process_event(&mut self, watcher_event: WatcherEvent) -> Result<()> {
-        let WatcherEvent {
-            parsed,
-            project_dir,
-            ..
-        } = watcher_event;
+        let WatcherEvent { parsed, project_dir, .. } = watcher_event;
 
         match &parsed {
-            ParsedEvent::SessionStart {
-                session_id,
-                timestamp,
-            } => {
-                self.ensure_session(session_id, *timestamp, &project_dir, None, None)
-                    .await?;
+            ParsedEvent::SessionStart { session_id, timestamp } => {
+                self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
             }
-            ParsedEvent::UserPrompt {
-                session_id,
-                timestamp,
-                content,
-                cwd,
-                git_branch,
-                ..
-            } => {
+            ParsedEvent::UserPrompt { session_id, timestamp, content, cwd, git_branch, .. } => {
                 self.ensure_session(
                     session_id,
                     *timestamp,
@@ -143,8 +128,7 @@ impl SessionManager {
                 output_tokens,
                 ..
             } => {
-                self.ensure_session(session_id, *timestamp, &project_dir, None, None)
-                    .await?;
+                self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
 
                 let metadata = serde_json::json!({
                     "model": model,
@@ -166,16 +150,8 @@ impl SessionManager {
                     active.last_event_at = *timestamp;
                 }
             }
-            ParsedEvent::ToolUse {
-                session_id,
-                timestamp,
-                tool_name,
-                tool_id,
-                input,
-                ..
-            } => {
-                self.ensure_session(session_id, *timestamp, &project_dir, None, None)
-                    .await?;
+            ParsedEvent::ToolUse { session_id, timestamp, tool_name, tool_id, input, .. } => {
+                self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
 
                 let metadata = serde_json::json!({
                     "tool_id": tool_id,
@@ -204,8 +180,7 @@ impl SessionManager {
                 content,
                 ..
             } => {
-                self.ensure_session(session_id, *timestamp, &project_dir, None, None)
-                    .await?;
+                self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
 
                 let metadata = serde_json::json!({
                     "tool_use_id": tool_use_id,
@@ -265,9 +240,8 @@ impl SessionManager {
         }
 
         // New session
-        let project_path = cwd
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| project_dir.replace('-', "/"));
+        let project_path =
+            cwd.map(|s| s.to_string()).unwrap_or_else(|| project_dir.replace('-', "/"));
 
         let session = store::Session {
             id: session_id.to_string(),
@@ -281,11 +255,7 @@ impl SessionManager {
 
         self.store.lock().await.upsert_session(&session)?;
 
-        tracing::info!(
-            "New session: {} (project: {})",
-            session_id,
-            project_path
-        );
+        tracing::info!("New session: {} (project: {})", session_id, project_path);
 
         self.active_sessions.insert(
             session_id.to_string(),
@@ -343,10 +313,7 @@ impl SessionManager {
 
     async fn end_session(&mut self, session_id: &str) -> Result<()> {
         if let Some(active) = self.active_sessions.remove(session_id) {
-            self.store
-                .lock()
-                .await
-                .end_session(session_id, active.last_event_at)?;
+            self.store.lock().await.end_session(session_id, active.last_event_at)?;
             tracing::info!(
                 "Session ended: {} ({} events, {} prompts)",
                 session_id,
@@ -371,14 +338,8 @@ impl SessionManager {
         self.active_sessions
             .values()
             .filter(|s| {
-                s.project_path
-                    .as_deref()
-                    .map(|p| p == repo_path)
-                    .unwrap_or(false)
-                    || s.cwd
-                        .as_deref()
-                        .map(|c| c == repo_path)
-                        .unwrap_or(false)
+                s.project_path.as_deref().map(|p| p == repo_path).unwrap_or(false)
+                    || s.cwd.as_deref().map(|c| c == repo_path).unwrap_or(false)
             })
             .map(|s| s.id.clone())
             .collect()
@@ -478,11 +439,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = store
-            .lock()
-            .await
-            .get_events_for_session("sess-2")
-            .unwrap();
+        let events = store.lock().await.get_events_for_session("sess-2").unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].event_type, "user_prompt");
         assert_eq!(events[1].event_type, "assistant_response");
@@ -514,12 +471,7 @@ mod tests {
 
         assert!(!mgr.active_sessions.contains_key("old-sess"));
 
-        let session = store
-            .lock()
-            .await
-            .get_session("old-sess")
-            .unwrap()
-            .unwrap();
+        let session = store.lock().await.get_session("old-sess").unwrap().unwrap();
         assert!(session.ended_at.is_some());
     }
 

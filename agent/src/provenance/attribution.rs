@@ -74,10 +74,7 @@ pub fn attribute_diff(
 }
 
 /// Attribute hunks from a pre-computed diff string (e.g., the full PR diff).
-pub fn attribute_diff_text(
-    diff_text: &str,
-    interactions: &[Interaction],
-) -> Vec<DiffAttribution> {
+pub fn attribute_diff_text(diff_text: &str, interactions: &[Interaction]) -> Vec<DiffAttribution> {
     let hunks = match parse_unified_diff(diff_text) {
         Ok(h) => h,
         Err(e) => {
@@ -106,32 +103,19 @@ pub fn attribute_diff_text(
 
 fn parse_commit_diff(repo_path: &str, commit_sha: &str) -> anyhow::Result<Vec<DiffHunk>> {
     let output = Command::new("git")
-        .args([
-            "diff",
-            &format!("{}~1", commit_sha),
-            commit_sha,
-            "--unified=0",
-        ])
+        .args(["diff", &format!("{}~1", commit_sha), commit_sha, "--unified=0"])
         .current_dir(repo_path)
         .output()?;
 
     if !output.status.success() {
         // Might be the first commit — try diff against empty tree
         let output = Command::new("git")
-            .args([
-                "diff",
-                "4b825dc642cb6eb9a060e54bf899d69f82534100",
-                commit_sha,
-                "--unified=0",
-            ])
+            .args(["diff", "4b825dc642cb6eb9a060e54bf899d69f82534100", commit_sha, "--unified=0"])
             .current_dir(repo_path)
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!(
-                "git diff failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            anyhow::bail!("git diff failed: {}", String::from_utf8_lossy(&output.stderr));
         }
         return parse_unified_diff(&String::from_utf8_lossy(&output.stdout));
     }
@@ -277,12 +261,9 @@ fn paths_match(tc_path: &str, diff_path: &str) -> bool {
 fn get_written_content(tc: &super::interaction::ToolCall) -> String {
     let name = tc.tool_name.to_lowercase();
     match name.as_str() {
-        "write" | "write_file" => tc
-            .input
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        "write" | "write_file" => {
+            tc.input.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
         "edit" | "str_replace" | "str_replace_editor" => tc
             .input
             .get("new_string")
@@ -296,20 +277,14 @@ fn get_written_content(tc: &super::interaction::ToolCall) -> String {
 
 /// Simple line-based similarity: fraction of diff lines found in written content.
 fn compute_similarity(diff_text: &str, written_text: &str) -> f32 {
-    let diff_lines: Vec<&str> = diff_text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let diff_lines: Vec<&str> =
+        diff_text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
 
     if diff_lines.is_empty() {
         return 0.0;
     }
 
-    let matched = diff_lines
-        .iter()
-        .filter(|line| written_text.contains(*line))
-        .count();
+    let matched = diff_lines.iter().filter(|line| written_text.contains(*line)).count();
 
     matched as f32 / diff_lines.len() as f32
 }
@@ -322,10 +297,7 @@ mod tests {
     fn test_parse_hunk_header() {
         assert_eq!(parse_hunk_header("@@ -0,0 +1,25 @@"), Some((1, 25)));
         assert_eq!(parse_hunk_header("@@ -10,5 +12 @@"), Some((12, 1)));
-        assert_eq!(
-            parse_hunk_header("@@ -1,3 +1,4 @@ fn main()"),
-            Some((1, 4))
-        );
+        assert_eq!(parse_hunk_header("@@ -1,3 +1,4 @@ fn main()"), Some((1, 4)));
     }
 
     #[test]

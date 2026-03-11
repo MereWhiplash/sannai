@@ -27,11 +27,8 @@ pub fn get_pr_commits(pr_url: &str) -> Result<Vec<String>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let shas: Vec<String> = stdout
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let shas: Vec<String> =
+        stdout.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
     Ok(shas)
 }
@@ -81,15 +78,7 @@ pub fn post_pr_comment(pr_url: &str, body: &str) -> Result<()> {
         tracing::info!("Updated existing Sannai comment on PR #{}", pr_number);
     } else {
         let output = Command::new("gh")
-            .args([
-                "pr",
-                "comment",
-                &pr_number,
-                "--repo",
-                &owner_repo,
-                "--body",
-                body,
-            ])
+            .args(["pr", "comment", &pr_number, "--repo", &owner_repo, "--body", body])
             .output()
             .context("Failed to post PR comment")?;
 
@@ -116,11 +105,7 @@ fn find_existing_comment(owner_repo: &str, pr_number: &str) -> Result<Option<Str
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let id = stdout
-            .lines()
-            .next()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let id = stdout.lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         Ok(id)
     } else {
         Ok(None)
@@ -159,8 +144,7 @@ mod tests {
 
     #[test]
     fn test_parse_pr_url_full() {
-        let (repo, number) =
-            parse_pr_url("https://github.com/AaronFR/sannai/pull/42").unwrap();
+        let (repo, number) = parse_pr_url("https://github.com/AaronFR/sannai/pull/42").unwrap();
         assert_eq!(repo, "AaronFR/sannai");
         assert_eq!(number, "42");
     }

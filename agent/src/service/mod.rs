@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Platform {
@@ -18,10 +18,8 @@ pub fn detect_platform() -> Platform {
 pub fn service_file_path(platform: Platform) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     match platform {
-        Platform::MacOS => PathBuf::from(&home)
-            .join("Library/LaunchAgents/dev.sannai.agent.plist"),
-        Platform::Linux => PathBuf::from(&home)
-            .join(".config/systemd/user/sannai.service"),
+        Platform::MacOS => PathBuf::from(&home).join("Library/LaunchAgents/dev.sannai.agent.plist"),
+        Platform::Linux => PathBuf::from(&home).join(".config/systemd/user/sannai.service"),
     }
 }
 
@@ -73,16 +71,9 @@ WantedBy=default.target
 }
 
 /// Install service file to a specific path (testable).
-pub fn install_service_to(
-    platform: Platform,
-    bin_path: &str,
-    path: &PathBuf,
-) -> Result<()> {
+pub fn install_service_to(platform: Platform, bin_path: &str, path: &Path) -> Result<()> {
     if path.exists() {
-        bail!(
-            "Service already installed at {}. Run `sannai uninstall` first.",
-            path.display()
-        );
+        bail!("Service already installed at {}. Run `sannai uninstall` first.", path.display());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -98,9 +89,7 @@ pub fn install_service_to(
 /// Install service and load it.
 pub fn install_service() -> Result<()> {
     let platform = detect_platform();
-    let bin_path = std::env::current_exe()?
-        .to_string_lossy()
-        .to_string();
+    let bin_path = std::env::current_exe()?.to_string_lossy().to_string();
     let path = service_file_path(platform);
 
     install_service_to(platform, &bin_path, &path)?;
@@ -117,9 +106,7 @@ pub fn install_service() -> Result<()> {
             println!("Sannai will start automatically on login.");
         }
         Platform::Linux => {
-            std::process::Command::new("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status()?;
+            std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status()?;
             let status = std::process::Command::new("systemctl")
                 .args(["--user", "enable", "--now", "sannai"])
                 .status()?;
@@ -136,7 +123,7 @@ pub fn install_service() -> Result<()> {
 }
 
 /// Remove service file (testable).
-pub fn uninstall_service_from(path: &PathBuf) -> Result<()> {
+pub fn uninstall_service_from(path: &Path) -> Result<()> {
     if !path.exists() {
         println!("No service installed.");
         return Ok(());
@@ -146,7 +133,7 @@ pub fn uninstall_service_from(path: &PathBuf) -> Result<()> {
 }
 
 /// Remove the data directory.
-pub fn purge_data_dir(data_dir: &PathBuf) -> Result<()> {
+pub fn purge_data_dir(data_dir: &Path) -> Result<()> {
     if data_dir.exists() {
         std::fs::remove_dir_all(data_dir)?;
         println!("Removed data directory: {}", data_dir.display());
@@ -188,7 +175,7 @@ pub fn uninstall_service(purge: bool) -> Result<()> {
 }
 
 /// Check if service is installed at a specific path (testable).
-pub fn is_service_installed_at(path: &PathBuf) -> bool {
+pub fn is_service_installed_at(path: &Path) -> bool {
     path.exists()
 }
 
@@ -266,8 +253,7 @@ mod tests {
         let bin_path = "/usr/local/bin/sannai";
 
         install_service_to(Platform::MacOS, bin_path, &service_path).unwrap();
-        let result =
-            install_service_to(Platform::MacOS, bin_path, &service_path);
+        let result = install_service_to(Platform::MacOS, bin_path, &service_path);
         assert!(result.is_err());
     }
 

@@ -76,8 +76,9 @@ pub struct Store {
 impl Store {
     pub fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create data directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create data directory: {}", parent.display())
+            })?;
         }
 
         let conn = Connection::open(db_path)
@@ -86,8 +87,7 @@ impl Store {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .context("Failed to set PRAGMA options")?;
 
-        conn.execute_batch(MIGRATION)
-            .context("Failed to run migrations")?;
+        conn.execute_batch(MIGRATION).context("Failed to run migrations")?;
 
         Ok(Self { conn })
     }
@@ -237,12 +237,7 @@ impl Store {
         self.conn.execute(
             "INSERT OR IGNORE INTO commit_links (commit_sha, session_id, repo_path, linked_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![
-                link.commit_sha,
-                link.session_id,
-                link.repo_path,
-                link.linked_at.to_rfc3339(),
-            ],
+            params![link.commit_sha, link.session_id, link.repo_path, link.linked_at.to_rfc3339(),],
         )?;
         Ok(())
     }
@@ -305,9 +300,7 @@ impl Store {
 }
 
 fn parse_datetime(s: String) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(&s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+    DateTime::parse_from_rfc3339(&s).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())
 }
 
 #[cfg(test)]
@@ -350,10 +343,7 @@ mod tests {
         let retrieved = store.get_session("test-session-1").unwrap().unwrap();
         assert_eq!(retrieved.id, "test-session-1");
         assert_eq!(retrieved.tool, "claude_code");
-        assert_eq!(
-            retrieved.project_path.as_deref(),
-            Some("/Users/test/project")
-        );
+        assert_eq!(retrieved.project_path.as_deref(), Some("/Users/test/project"));
         assert!(retrieved.ended_at.is_none());
     }
 
@@ -374,17 +364,11 @@ mod tests {
         store.upsert_session(&session).unwrap();
 
         // Upsert with project_path set
-        let updated = Session {
-            project_path: Some("/Users/test/updated".to_string()),
-            ..session
-        };
+        let updated = Session { project_path: Some("/Users/test/updated".to_string()), ..session };
         store.upsert_session(&updated).unwrap();
 
         let retrieved = store.get_session("test-session-2").unwrap().unwrap();
-        assert_eq!(
-            retrieved.project_path.as_deref(),
-            Some("/Users/test/updated")
-        );
+        assert_eq!(retrieved.project_path.as_deref(), Some("/Users/test/updated"));
     }
 
     #[test]
@@ -484,9 +468,7 @@ mod tests {
         assert_eq!(events[0].event_type, "user_prompt");
         assert_eq!(events[1].event_type, "assistant_response");
 
-        let count = store
-            .count_events_for_session("event-test-session")
-            .unwrap();
+        let count = store.count_events_for_session("event-test-session").unwrap();
         assert_eq!(count, 2);
     }
 

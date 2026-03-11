@@ -44,9 +44,7 @@ pub async fn serve(state: AppState, cancel: CancellationToken) -> anyhow::Result
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:9847").await?;
     tracing::info!("Local API server listening on 127.0.0.1:9847");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(cancel.cancelled_owned())
-        .await?;
+    axum::serve(listener, app).with_graceful_shutdown(cancel.cancelled_owned()).await?;
     Ok(())
 }
 
@@ -78,11 +76,7 @@ async fn hook_commit(
     State(state): State<AppState>,
     Json(req): Json<CommitHookRequest>,
 ) -> Result<Json<CommitHookResponse>, StatusCode> {
-    let session_ids = state
-        .session_manager
-        .lock()
-        .await
-        .active_sessions_for_repo(&req.repo);
+    let session_ids = state.session_manager.lock().await.active_sessions_for_repo(&req.repo);
 
     let store = state.store.lock().await;
     let mut linked = Vec::new();
@@ -108,9 +102,7 @@ async fn hook_commit(
         req.repo,
     );
 
-    Ok(Json(CommitHookResponse {
-        linked_sessions: linked,
-    }))
+    Ok(Json(CommitHookResponse { linked_sessions: linked }))
 }
 
 // --- GET /sessions ---
@@ -148,9 +140,7 @@ async fn list_sessions(
 
     let mut response = Vec::new();
     for s in sessions {
-        let count = store
-            .count_events_for_session(&s.id)
-            .unwrap_or(0);
+        let count = store.count_events_for_session(&s.id).unwrap_or(0);
         response.push(SessionResponse {
             id: s.id,
             tool: s.tool,
@@ -176,9 +166,7 @@ async fn get_session(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let count = store
-        .count_events_for_session(&session.id)
-        .unwrap_or(0);
+    let count = store.count_events_for_session(&session.id).unwrap_or(0);
 
     Ok(Json(SessionResponse {
         id: session.id,
@@ -204,9 +192,8 @@ async fn get_session_events(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let events = store
-        .get_events_for_session(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let events =
+        store.get_events_for_session(&id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(events))
 }

@@ -56,11 +56,8 @@ fn classify_tool_call(tc: &ToolCall) -> Option<(String, FileOp)> {
     match name.as_str() {
         "read" | "read_file" => {
             let path = extract_file_path(&tc.input)?;
-            let snippet = tc
-                .output
-                .as_deref()
-                .map(|s| truncate(s, SNIPPET_MAX_LEN))
-                .unwrap_or_default();
+            let snippet =
+                tc.output.as_deref().map(|s| truncate(s, SNIPPET_MAX_LEN)).unwrap_or_default();
             Some((
                 path,
                 FileOp {
@@ -72,11 +69,7 @@ fn classify_tool_call(tc: &ToolCall) -> Option<(String, FileOp)> {
         }
         "write" | "write_file" => {
             let path = extract_file_path(&tc.input)?;
-            let content = tc
-                .input
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let content = tc.input.get("content").and_then(|v| v.as_str()).unwrap_or("");
             Some((
                 path,
                 FileOp {
@@ -158,7 +151,12 @@ mod tests {
         }
     }
 
-    fn make_tool_call(name: &str, input: serde_json::Value, output: Option<&str>, seq: u32) -> ToolCall {
+    fn make_tool_call(
+        name: &str,
+        input: serde_json::Value,
+        output: Option<&str>,
+        seq: u32,
+    ) -> ToolCall {
         ToolCall {
             tool_name: name.to_string(),
             tool_id: format!("toolu_{}", seq),
@@ -251,12 +249,8 @@ mod tests {
 
     #[test]
     fn test_bash_ignored() {
-        let tc = make_tool_call(
-            "Bash",
-            serde_json::json!({"command": "ls -la"}),
-            Some("output"),
-            1,
-        );
+        let tc =
+            make_tool_call("Bash", serde_json::json!({"command": "ls -la"}), Some("output"), 1);
         let interaction = make_interaction(vec![tc]);
         let lineage = build_lineage(&interaction);
         assert!(lineage.is_empty());

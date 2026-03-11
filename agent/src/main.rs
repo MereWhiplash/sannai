@@ -84,11 +84,7 @@ async fn main() -> anyhow::Result<()> {
             }
             println!(
                 "Service installed: {}",
-                if service::is_service_installed() {
-                    "yes"
-                } else {
-                    "no"
-                }
+                if service::is_service_installed() { "yes" } else { "no" }
             );
             let data_dir = daemon::data_dir();
             println!("Data directory: {}", data_dir.display());
@@ -112,10 +108,7 @@ async fn main() -> anyhow::Result<()> {
             if sessions.is_empty() {
                 println!("No sessions captured yet.");
             } else {
-                println!(
-                    "{:<38} {:<12} {:<40} STARTED",
-                    "SESSION ID", "TOOL", "PROJECT"
-                );
+                println!("{:<38} {:<12} {:<40} STARTED", "SESSION ID", "TOOL", "PROJECT");
                 println!("{}", "-".repeat(110));
                 for session in &sessions {
                     println!(
@@ -138,13 +131,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
-    let repo_path = repo_path
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string())
-        });
+    let repo_path = repo_path.map(|s| s.to_string()).unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
 
     // 1. Load config
     let cfg = config::load_config();
@@ -177,10 +168,7 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
         println!("No commit-linked sessions found, trying project path matching...");
         for session in store.list_sessions(100, 0)? {
             if let Some(proj) = &session.project_path {
-                if proj == &repo_path
-                    || repo_path.ends_with(proj)
-                    || proj.ends_with(&repo_path)
-                {
+                if proj == &repo_path || repo_path.ends_with(proj) || proj.ends_with(&repo_path) {
                     session_ids.insert(session.id);
                 }
             }
@@ -202,21 +190,19 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
 
     for session_id in &session_ids {
         let events = store.get_events_for_session(session_id)?;
-        let interactions =
-            provenance::interaction::build_interactions(session_id, &events);
+        let interactions = provenance::interaction::build_interactions(session_id, &events);
 
         let mut session_lineage = Vec::new();
         for interaction in &interactions {
             session_lineage.extend(provenance::lineage::build_lineage(interaction));
         }
 
-        let duration = if let (Some(first), Some(last)) =
-            (interactions.first(), interactions.last())
-        {
-            format_duration(last.timestamp_end - first.timestamp_start)
-        } else {
-            "0m".to_string()
-        };
+        let duration =
+            if let (Some(first), Some(last)) = (interactions.first(), interactions.last()) {
+                format_duration(last.timestamp_end - first.timestamp_start)
+            } else {
+                "0m".to_string()
+            };
 
         session_summaries.push(comment::format::SessionSummary {
             session_id: session_id.clone(),
@@ -327,10 +313,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     )));
 
     // 7. API state
-    let api_state = api::AppState {
-        store: store.clone(),
-        session_manager: session_mgr.clone(),
-    };
+    let api_state = api::AppState { store: store.clone(), session_manager: session_mgr.clone() };
 
     // 8. Spawn all tasks
     let claude_dir = daemon::claude_projects_dir();
@@ -343,20 +326,13 @@ async fn run_daemon() -> anyhow::Result<()> {
     });
 
     let session_cancel = cancel.clone();
-    let session_handle = tokio::spawn(async move {
-        session_mgr.lock().await.run(rx, session_cancel).await
-    });
+    let session_handle =
+        tokio::spawn(async move { session_mgr.lock().await.run(rx, session_cancel).await });
 
     let api_cancel = cancel.clone();
-    let api_handle = tokio::spawn(async move {
-        api::serve(api_state, api_cancel).await
-    });
+    let api_handle = tokio::spawn(async move { api::serve(api_state, api_cancel).await });
 
-    tracing::info!(
-        "sannai daemon started (PID {}, db={})",
-        std::process::id(),
-        db_path.display(),
-    );
+    tracing::info!("sannai daemon started (PID {}, db={})", std::process::id(), db_path.display(),);
 
     // 9. Wait for any task to complete (or cancellation)
     tokio::select! {
