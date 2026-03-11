@@ -1,4 +1,4 @@
-# Agent — sannai-agent (Rust)
+# Agent — sannai (Rust)
 
 Local daemon that captures Claude Code sessions. Binary name: `sannai`.
 
@@ -50,14 +50,14 @@ watcher -> parser -> session -> store
 ## Conventions
 
 - Error handling: `anyhow::Result` everywhere, `bail!` for early returns
-- Logging: `tracing` crate, filter via `RUST_LOG` env var (default: `sannai_agent=info`)
+- Logging: `tracing` crate, filter via `RUST_LOG` env var (default: `sannai=info`)
 - Tests use `tempfile::TempDir` for isolated SQLite databases
 - JSONL format uses camelCase field names (matches Claude Code output), Rust structs use snake_case with `#[serde(rename_all = "camelCase")]`
 
 ## File Paths at Runtime
 
-- Data dir: `~/Library/Application Support/dev.sannai.sannai-agent/` (macOS)
+- Data dir: `~/Library/Application Support/dev.sannai.sannai/` (macOS)
 - SQLite DB: `<data_dir>/store.db`
 - Watcher state: `<data_dir>/watcher_state.json`
-- PID file: `<data_dir>/sannai-agent.pid`
+- PID file: `<data_dir>/sannai.pid`
 - Watched dir: `~/.claude/projects/`

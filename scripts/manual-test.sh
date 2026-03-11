@@ -65,7 +65,7 @@ echo ""
 echo "--- Starting agent ---"
 SANNAI_CLAUDE_DIR="$CLAUDE_DIR" \
 SANNAI_DATA_DIR="$DATA_DIR" \
-RUST_LOG=sannai_agent=info \
+RUST_LOG=sannai=info \
 "$AGENT_BIN" start --foreground &
 AGENT_PID=$!
 echo "Agent PID: $AGENT_PID"

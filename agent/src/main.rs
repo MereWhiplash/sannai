@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use sannai_agent::{api, comment, config, daemon, provenance, session, store, watcher};
+use sannai::{api, comment, config, daemon, provenance, session, store, watcher};
 
 #[derive(Parser)]
 #[command(name = "sannai")]
@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sannai_agent=info".into()),
+                .unwrap_or_else(|_| "sannai=info".into()),
         )
         .init();
 

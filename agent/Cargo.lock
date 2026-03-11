@@ -1454,7 +1454,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sannai-agent"
+name = "sannai"
 version = "0.1.0"
 dependencies = [
  "anyhow",

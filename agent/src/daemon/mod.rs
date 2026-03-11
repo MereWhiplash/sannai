@@ -4,14 +4,14 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Data directory for the store DB and watcher state.
-/// macOS: ~/Library/Application Support/dev.sannai.sannai-agent/
-/// Linux: ~/.local/share/sannai-agent/
+/// macOS: ~/Library/Application Support/dev.sannai.sannai/
+/// Linux: ~/.local/share/sannai/
 /// Override with SANNAI_DATA_DIR for testing.
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SANNAI_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    ProjectDirs::from("dev", "sannai", "sannai-agent")
+    ProjectDirs::from("dev", "sannai", "sannai")
         .map(|dirs| dirs.data_dir().to_path_buf())
         .unwrap_or_else(|| {
             let home = std::env::var("HOME")
@@ -35,7 +35,7 @@ pub fn claude_projects_dir() -> PathBuf {
 
 /// PID file path.
 fn pid_file_path() -> PathBuf {
-    data_dir().join("sannai-agent.pid")
+    data_dir().join("sannai.pid")
 }
 
 /// Write current PID to pidfile. Returns error if daemon is already running.
