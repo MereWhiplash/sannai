@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/MereWhiplash/sannai/actions/workflows/ci.yml/badge.svg)](https://github.com/MereWhiplash/sannai/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Crate](https://img.shields.io/crates/v/sannai.svg)](https://crates.io/crates/sannai)
 
 AI code provenance for your team. Sannai captures AI coding sessions and links them to pull requests so reviewers can see how code was generated.
 

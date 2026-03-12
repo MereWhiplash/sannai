@@ -41,7 +41,11 @@ pub fn format_comment(data: &CommentData) -> String {
         let total = stats.ai_generated_lines + stats.ai_assisted_lines + stats.unlinked_lines;
         if total > 0 {
             let pct = |n: u32| -> u32 {
-                if total == 0 { 0 } else { ((n as f64 / total as f64) * 100.0).round() as u32 }
+                if total == 0 {
+                    0
+                } else {
+                    ((n as f64 / total as f64) * 100.0).round() as u32
+                }
             };
             md.push_str("| AI-generated | AI-assisted | Unlinked |\n");
             md.push_str("|:---:|:---:|:---:|\n");

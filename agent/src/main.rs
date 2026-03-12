@@ -195,9 +195,7 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
                 // For unclosed sessions, use last event time instead of "now"
                 let session_end = match session.ended_at {
                     Some(t) => t,
-                    None => store
-                        .get_last_event_time(&session.id)?
-                        .unwrap_or(session.started_at),
+                    None => store.get_last_event_time(&session.id)?.unwrap_or(session.started_at),
                 };
                 // Check if any commit was made during this session's active period
                 let has_commit_during_session = commit_times.iter().any(|ct| {

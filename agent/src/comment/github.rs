@@ -58,10 +58,8 @@ pub fn get_pr_commit_times(pr_url: &str) -> Result<Vec<DateTime<Utc>>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let dates: Vec<DateTime<Utc>> = stdout
-        .lines()
-        .filter_map(|s| s.trim().parse::<DateTime<Utc>>().ok())
-        .collect();
+    let dates: Vec<DateTime<Utc>> =
+        stdout.lines().filter_map(|s| s.trim().parse::<DateTime<Utc>>().ok()).collect();
 
     Ok(dates)
 }
@@ -208,7 +206,8 @@ mod tests {
 
     #[test]
     fn test_parse_pr_url_full() {
-        let (repo, number) = parse_pr_url("https://github.com/MereWhiplash/sannai/pull/42").unwrap();
+        let (repo, number) =
+            parse_pr_url("https://github.com/MereWhiplash/sannai/pull/42").unwrap();
         assert_eq!(repo, "MereWhiplash/sannai");
         assert_eq!(number, "42");
     }

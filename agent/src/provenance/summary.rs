@@ -91,9 +91,7 @@ fn build_prompt(bundle: &ProvenanceBundle) -> String {
                                 .get("file_path")
                                 .or_else(|| tc.input.get("path"))
                                 .and_then(|v| v.as_str())
-                                .map(|p| {
-                                    p.rsplit('/').next().unwrap_or(p).to_string()
-                                })
+                                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
                         })
                         .collect();
                     let unique: Vec<String> = {
@@ -149,8 +147,10 @@ fn build_prompt(bundle: &ProvenanceBundle) -> String {
         ));
 
         // Per-file breakdown (top 10 files by changed lines)
-        let mut file_lines: std::collections::HashMap<&str, (u32, &super::attribution::AttributionType)> =
-            std::collections::HashMap::new();
+        let mut file_lines: std::collections::HashMap<
+            &str,
+            (u32, &super::attribution::AttributionType),
+        > = std::collections::HashMap::new();
         for attr in &bundle.attributions {
             let lines = attr.hunk_end.saturating_sub(attr.hunk_start) + 1;
             let entry = file_lines.entry(&attr.file_path).or_insert((0, &attr.attribution_type));
@@ -169,13 +169,12 @@ fn build_prompt(bundle: &ProvenanceBundle) -> String {
 
     // --- Diff stats (just the shape, not the full diff) ---
     if !bundle.diff.is_empty() {
-        let added = bundle.diff.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
-        let removed = bundle.diff.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
-        let files_changed: std::collections::HashSet<&str> = bundle
-            .diff
-            .lines()
-            .filter_map(|l| l.strip_prefix("+++ b/"))
-            .collect();
+        let added =
+            bundle.diff.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+        let removed =
+            bundle.diff.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+        let files_changed: std::collections::HashSet<&str> =
+            bundle.diff.lines().filter_map(|l| l.strip_prefix("+++ b/")).collect();
         prompt.push_str(&format!(
             "## Diff Stats\n\n{} files changed, +{} lines, -{} lines\n\n",
             files_changed.len(),
@@ -325,7 +324,8 @@ mod tests {
             attributions: vec![],
             diff: String::new(),
         };
-        let config = SummaryConfig { enabled: false, command: "echo test".to_string(), max_length: 2000 };
+        let config =
+            SummaryConfig { enabled: false, command: "echo test".to_string(), max_length: 2000 };
         assert!(generate_summary(&bundle, &config).is_none());
     }
 
@@ -339,7 +339,8 @@ mod tests {
         };
         let config = SummaryConfig {
             enabled: true,
-            command: "echo 'This is a long summary that should be truncated at some point'".to_string(),
+            command: "echo 'This is a long summary that should be truncated at some point'"
+                .to_string(),
             max_length: 20,
         };
         let result = generate_summary(&bundle, &config);

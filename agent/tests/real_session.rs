@@ -78,22 +78,10 @@ fn test_parse_real_session_file() {
     println!("=================================\n");
 
     // Assertions
-    assert_eq!(
-        stats.parse_errors, 0,
-        "Parser should handle all lines without errors"
-    );
-    assert!(
-        stats.user_prompts > 0,
-        "Expected at least one user prompt"
-    );
-    assert!(
-        stats.assistant_texts > 0,
-        "Expected at least one assistant text"
-    );
-    assert!(
-        stats.tool_uses > 0 || stats.ignored > 0,
-        "Expected some tool uses or ignored events"
-    );
+    assert_eq!(stats.parse_errors, 0, "Parser should handle all lines without errors");
+    assert!(stats.user_prompts > 0, "Expected at least one user prompt");
+    assert!(stats.assistant_texts > 0, "Expected at least one assistant text");
+    assert!(stats.tool_uses > 0 || stats.ignored > 0, "Expected some tool uses or ignored events");
 }
 
 #[derive(Default)]

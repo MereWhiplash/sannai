@@ -66,10 +66,8 @@ pub fn build_interactions(session_id: &str, events: &[Event]) -> Vec<Interaction
     }
 
     // Filter noise interactions and renumber
-    let mut filtered: Vec<Interaction> = interactions
-        .into_iter()
-        .filter(|i| !is_noise_interaction(&i.prompt))
-        .collect();
+    let mut filtered: Vec<Interaction> =
+        interactions.into_iter().filter(|i| !is_noise_interaction(&i.prompt)).collect();
     for (i, interaction) in filtered.iter_mut().enumerate() {
         interaction.sequence = (i + 1) as u32;
         interaction.id = format!("{}-{}", session_id, interaction.sequence);
@@ -97,8 +95,8 @@ fn is_noise_interaction(prompt: &str) -> bool {
     if trimmed.starts_with('/') {
         let cmd = trimmed.split_whitespace().next().unwrap_or("");
         let noise_commands = [
-            "/clear", "/exit", "/help", "/compact", "/quit", "/logout",
-            "/status", "/version", "/config", "/model", "/fast",
+            "/clear", "/exit", "/help", "/compact", "/quit", "/logout", "/status", "/version",
+            "/config", "/model", "/fast",
         ];
         if noise_commands.iter().any(|nc| cmd.eq_ignore_ascii_case(nc)) {
             return true;
@@ -108,8 +106,8 @@ fn is_noise_interaction(prompt: &str) -> bool {
     // Single-word non-coding prompts
     let lower = trimmed.to_lowercase();
     let noise_words = [
-        "commit", "done", "thanks", "continue", "go", "stop", "lgtm", "ship",
-        "ok", "okay", "sure", "yep", "nope", "thanks!", "ty",
+        "commit", "done", "thanks", "continue", "go", "stop", "lgtm", "ship", "ok", "okay", "sure",
+        "yep", "nope", "thanks!", "ty",
     ];
     if !trimmed.contains(' ') && noise_words.iter().any(|w| lower == *w) {
         return true;
@@ -335,19 +333,9 @@ mod tests {
         let now = Utc::now();
         let events = vec![
             make_event("user_prompt", Some("y"), now, None),
-            make_event(
-                "assistant_response",
-                Some("ok"),
-                now + Duration::seconds(1),
-                None,
-            ),
+            make_event("assistant_response", Some("ok"), now + Duration::seconds(1), None),
             make_event("user_prompt", Some("Fix the real bug"), now + Duration::seconds(5), None),
-            make_event(
-                "assistant_response",
-                Some("Fixed"),
-                now + Duration::seconds(6),
-                None,
-            ),
+            make_event("assistant_response", Some("Fixed"), now + Duration::seconds(6), None),
             make_event("user_prompt", Some("thanks"), now + Duration::seconds(10), None),
             make_event(
                 "assistant_response",
@@ -368,31 +356,16 @@ mod tests {
         let now = Utc::now();
         let events = vec![
             make_event("user_prompt", Some("/compact"), now, None),
-            make_event(
-                "assistant_response",
-                Some("Compacted"),
-                now + Duration::seconds(1),
-                None,
-            ),
+            make_event("assistant_response", Some("Compacted"), now + Duration::seconds(1), None),
             make_event("user_prompt", Some("/clear"), now + Duration::seconds(5), None),
-            make_event(
-                "assistant_response",
-                Some("Cleared"),
-                now + Duration::seconds(6),
-                None,
-            ),
+            make_event("assistant_response", Some("Cleared"), now + Duration::seconds(6), None),
             make_event(
                 "user_prompt",
                 Some("Add error handling to the parser"),
                 now + Duration::seconds(10),
                 None,
             ),
-            make_event(
-                "assistant_response",
-                Some("Done"),
-                now + Duration::seconds(11),
-                None,
-            ),
+            make_event("assistant_response", Some("Done"), now + Duration::seconds(11), None),
         ];
 
         let interactions = build_interactions("test-session", &events);
@@ -410,24 +383,9 @@ mod tests {
                 now,
                 None,
             ),
-            make_event(
-                "assistant_response",
-                Some("handled"),
-                now + Duration::seconds(1),
-                None,
-            ),
-            make_event(
-                "user_prompt",
-                Some("Refactor the tests"),
-                now + Duration::seconds(5),
-                None,
-            ),
-            make_event(
-                "assistant_response",
-                Some("Refactored"),
-                now + Duration::seconds(6),
-                None,
-            ),
+            make_event("assistant_response", Some("handled"), now + Duration::seconds(1), None),
+            make_event("user_prompt", Some("Refactor the tests"), now + Duration::seconds(5), None),
+            make_event("assistant_response", Some("Refactored"), now + Duration::seconds(6), None),
         ];
 
         let interactions = build_interactions("test-session", &events);
