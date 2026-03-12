@@ -73,6 +73,25 @@ pub fn attribute_diff(
         .collect()
 }
 
+/// Patterns for generated/lock files that should be excluded from attribution.
+const GENERATED_PATTERNS: &[&str] = &[
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "yarn.lock",
+    "Cargo.lock",
+    "go.sum",
+    "Gemfile.lock",
+    "poetry.lock",
+    "composer.lock",
+    ".min.js",
+    ".min.css",
+];
+
+/// Returns true if the file path matches a generated/lock file pattern.
+fn is_generated_file(path: &str) -> bool {
+    GENERATED_PATTERNS.iter().any(|pat| path.ends_with(pat))
+}
+
 /// Attribute hunks from a pre-computed diff string (e.g., the full PR diff).
 pub fn attribute_diff_text(diff_text: &str, interactions: &[Interaction]) -> Vec<DiffAttribution> {
     let hunks = match parse_unified_diff(diff_text) {
@@ -85,6 +104,7 @@ pub fn attribute_diff_text(diff_text: &str, interactions: &[Interaction]) -> Vec
 
     hunks
         .iter()
+        .filter(|hunk| !is_generated_file(&hunk.file_path))
         .map(|hunk| {
             let (interaction_id, confidence, attribution_type) =
                 match_hunk_to_interaction(hunk, interactions);
@@ -244,8 +264,8 @@ fn match_hunk_to_interaction(
     match best_match {
         Some((id, conf)) if conf >= 0.7 => (Some(id), conf, AttributionType::AiGenerated),
         Some((id, conf)) if conf >= 0.3 => (Some(id), conf, AttributionType::AiAssisted),
-        Some((id, conf)) => (Some(id), conf, AttributionType::Manual),
-        None => (None, 0.0, AttributionType::Manual),
+        Some((id, conf)) => (Some(id), conf, AttributionType::AiAssisted),
+        None => (None, 0.0, AttributionType::Unknown),
     }
 }
 

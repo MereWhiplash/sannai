@@ -163,28 +163,47 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    // Fallback: match sessions by repo path + time window
+    // Fallback: timestamp matching only when no commit links exist at all
     if session_ids.is_empty() {
-        println!("No commit-linked sessions found, trying project path matching...");
-        let time_range = comment::github::get_pr_commit_time_range(pr_url)?;
+        println!("No commit-linked sessions found, trying timestamp matching...");
+        let commit_times = comment::github::get_pr_commit_times(pr_url)?;
+        let pr_branch = comment::github::get_pr_head_branch(pr_url)?;
+        if let Some(ref branch) = pr_branch {
+            println!("PR head branch: {}", branch);
+        }
+        println!("Matching {} commit timestamps against sessions...", commit_times.len());
+
+        // Small tolerance for clock skew between git and sannai timestamps
+        let tolerance = chrono::Duration::minutes(5);
+
         for session in store.list_sessions(1000, 0)? {
             if let Some(proj) = &session.project_path {
-                let path_match =
-                    proj == &repo_path || repo_path.ends_with(proj) || proj.ends_with(&repo_path);
+                let path_match = proj == &repo_path
+                    || repo_path.ends_with(proj)
+                    || proj.ends_with(&repo_path)
+                    || proj.starts_with(&format!("{}/", repo_path))
+                    || repo_path.starts_with(&format!("{}/", proj));
                 if !path_match {
                     continue;
                 }
-                // Filter by time: session must overlap with PR commit window (with 2hr buffer)
-                if let Some((earliest, latest)) = &time_range {
-                    let buffer = chrono::Duration::hours(2);
-                    let window_start = *earliest - buffer;
-                    let window_end = *latest + buffer;
-                    let session_end = session.ended_at.unwrap_or(chrono::Utc::now());
-                    if session.started_at <= window_end && session_end >= window_start {
-                        session_ids.insert(session.id);
+                // Filter by branch: if both PR branch and session branch are known, they must match
+                if let (Some(ref pr_br), Some(ref sess_br)) = (&pr_branch, &session.git_branch) {
+                    if pr_br != sess_br {
+                        continue;
                     }
-                } else {
-                    // No time range available, include all path matches
+                }
+                // For unclosed sessions, use last event time instead of "now"
+                let session_end = match session.ended_at {
+                    Some(t) => t,
+                    None => store
+                        .get_last_event_time(&session.id)?
+                        .unwrap_or(session.started_at),
+                };
+                // Check if any commit was made during this session's active period
+                let has_commit_during_session = commit_times.iter().any(|ct| {
+                    *ct >= session.started_at - tolerance && *ct <= session_end + tolerance
+                });
+                if has_commit_during_session {
                     session_ids.insert(session.id);
                 }
             }
@@ -213,11 +232,27 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
             session_lineage.extend(provenance::lineage::build_lineage(interaction));
         }
 
-        let duration =
+        // Active time = sum of individual interaction durations
+        let active_duration: chrono::Duration = interactions
+            .iter()
+            .map(|i| i.timestamp_end - i.timestamp_start)
+            .fold(chrono::Duration::zero(), |acc, d| acc + d);
+        let duration = format_duration(active_duration);
+
+        // Wall time = first start to last end
+        let wall_time =
             if let (Some(first), Some(last)) = (interactions.first(), interactions.last()) {
-                format_duration(last.timestamp_end - first.timestamp_start)
+                let wall = last.timestamp_end - first.timestamp_start;
+                let wall_secs = wall.num_seconds();
+                let active_secs = active_duration.num_seconds();
+                // Only show wall time when it's > 2x active time and > 10min
+                if active_secs > 0 && wall_secs > active_secs * 2 && wall_secs > 600 {
+                    Some(format_duration(wall))
+                } else {
+                    None
+                }
             } else {
-                "0m".to_string()
+                None
             };
 
         session_summaries.push(comment::format::SessionSummary {
@@ -225,6 +260,7 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
             interactions: interactions.clone(),
             lineage: session_lineage.clone(),
             duration,
+            wall_time,
         });
 
         all_interactions.extend(interactions);

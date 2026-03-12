@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::provenance::attribution::{AttributionType, DiffAttribution};
 use crate::provenance::interaction::Interaction;
 use crate::provenance::lineage::{FileLineage, FileOpType};
@@ -13,6 +15,8 @@ pub struct SessionSummary {
     pub interactions: Vec<Interaction>,
     pub lineage: Vec<FileLineage>,
     pub duration: String,
+    /// Only shown when wall time > 2x active time and > 10min.
+    pub wall_time: Option<String>,
 }
 
 pub fn format_comment(data: &CommentData) -> String {
@@ -22,14 +26,36 @@ pub fn format_comment(data: &CommentData) -> String {
     let total_interactions: usize = data.sessions.iter().map(|s| s.interactions.len()).sum();
     let total_sessions = data.sessions.len();
 
-    md.push_str("## \u{1f50d} Sannai Code Provenance\n\n");
+    md.push_str("## Sannai Code Provenance\n\n");
     md.push_str(&format!(
-        "**{} AI session{}** contributed to this PR across **{} interaction{}**.\n\n",
+        "**{} AI session{}** across **{} interaction{}**.\n\n",
         total_sessions,
         if total_sessions != 1 { "s" } else { "" },
         total_interactions,
         if total_interactions != 1 { "s" } else { "" },
     ));
+
+    // Summary stats table
+    if !data.attributions.is_empty() {
+        let stats = compute_attribution_stats(&data.attributions);
+        let total = stats.ai_generated_lines + stats.ai_assisted_lines + stats.unlinked_lines;
+        if total > 0 {
+            let pct = |n: u32| -> u32 {
+                if total == 0 { 0 } else { ((n as f64 / total as f64) * 100.0).round() as u32 }
+            };
+            md.push_str("| AI-generated | AI-assisted | Unlinked |\n");
+            md.push_str("|:---:|:---:|:---:|\n");
+            md.push_str(&format!(
+                "| {}% ({} lines) | {}% ({} lines) | {}% ({} lines) |\n\n",
+                pct(stats.ai_generated_lines),
+                stats.ai_generated_lines,
+                pct(stats.ai_assisted_lines),
+                stats.ai_assisted_lines,
+                pct(stats.unlinked_lines),
+                stats.unlinked_lines,
+            ));
+        }
+    }
 
     // LLM Summary
     if let Some(summary) = &data.llm_summary {
@@ -38,19 +64,28 @@ pub fn format_comment(data: &CommentData) -> String {
         md.push_str("\n\n");
     }
 
-    // Per-session interaction tables
+    // Per-session interaction tables in collapsible sections
     for session in &data.sessions {
         let short_id = &session.session_id[..std::cmp::min(8, session.session_id.len())];
+        let n = session.interactions.len();
+
+        let wall_note = match &session.wall_time {
+            Some(wt) => format!(", {} wall", wt),
+            None => String::new(),
+        };
+
+        md.push_str("<details>\n");
         md.push_str(&format!(
-            "### Session: `{}` \u{2014} {} interaction{}, {}\n\n",
+            "<summary>Session <code>{}</code> \u{2014} {} interaction{}, {} active{}</summary>\n\n",
             short_id,
-            session.interactions.len(),
-            if session.interactions.len() != 1 { "s" } else { "" },
+            n,
+            if n != 1 { "s" } else { "" },
             session.duration,
+            wall_note,
         ));
 
-        md.push_str("| # | Prompt | Files touched | Attribution |\n");
-        md.push_str("|---|--------|--------------|-------------|\n");
+        md.push_str("| # | Prompt | Files | Attribution |\n");
+        md.push_str("|---|--------|-------|-------------|\n");
 
         for interaction in &session.interactions {
             let prompt_preview = truncate_for_table(&interaction.prompt, 60);
@@ -62,43 +97,27 @@ pub fn format_comment(data: &CommentData) -> String {
                 interaction.sequence, prompt_preview, files, attr,
             ));
         }
-        md.push('\n');
+        md.push_str("\n</details>\n\n");
     }
 
-    // Diff Attribution table
+    // Diff attribution in collapsible section, aggregated per-file
     if !data.attributions.is_empty() {
-        md.push_str("### Diff Attribution\n\n");
-        md.push_str("| File | Lines | Source | Confidence |\n");
-        md.push_str("|------|-------|--------|------------|\n");
+        let file_attrs = aggregate_file_attributions(&data.attributions);
+        md.push_str("<details>\n");
+        md.push_str(&format!(
+            "<summary>Diff attribution ({} file{})</summary>\n\n",
+            file_attrs.len(),
+            if file_attrs.len() != 1 { "s" } else { "" },
+        ));
 
-        for attr in &data.attributions {
-            let source = match &attr.interaction_id {
-                Some(id) => {
-                    let seq = id.rsplit('-').next().unwrap_or("?");
-                    format!("Interaction #{}", seq)
-                }
-                None => "Manual".to_string(),
-            };
+        md.push_str("| File | Lines | Source |\n");
+        md.push_str("|------|-------|--------|\n");
 
-            let icon = match attr.attribution_type {
-                AttributionType::AiGenerated => "\u{1f916}",
-                AttributionType::AiAssisted => "\u{1f9d1}\u{200d}\u{1f4bb}",
-                AttributionType::Manual => "\u{270d}\u{fe0f}",
-                AttributionType::Unknown => "\u{2753}",
-            };
-
-            let confidence = if attr.confidence > 0.0 {
-                format!("{}%", (attr.confidence * 100.0) as u32)
-            } else {
-                "\u{2014}".to_string()
-            };
-
-            md.push_str(&format!(
-                "| {} | {}-{} | {} {} | {} |\n",
-                attr.file_path, attr.hunk_start, attr.hunk_end, icon, source, confidence,
-            ));
+        for fa in &file_attrs {
+            let label = format_attribution_label(&fa.attribution_type, fa.confidence);
+            md.push_str(&format!("| {} | {} | {} |\n", fa.file_path, fa.total_lines, label,));
         }
-        md.push('\n');
+        md.push_str("\n</details>\n\n");
     }
 
     // Footer
@@ -106,6 +125,76 @@ pub fn format_comment(data: &CommentData) -> String {
     md.push_str("<sub>Generated by [Sannai](https://github.com/AaronFR/sannai) \u{2014} code provenance for AI-assisted development</sub>\n");
 
     md
+}
+
+struct AttributionStats {
+    ai_generated_lines: u32,
+    ai_assisted_lines: u32,
+    unlinked_lines: u32,
+}
+
+fn compute_attribution_stats(attributions: &[DiffAttribution]) -> AttributionStats {
+    let mut stats =
+        AttributionStats { ai_generated_lines: 0, ai_assisted_lines: 0, unlinked_lines: 0 };
+
+    for attr in attributions {
+        let lines = attr.hunk_end.saturating_sub(attr.hunk_start) + 1;
+        match attr.attribution_type {
+            AttributionType::AiGenerated => stats.ai_generated_lines += lines,
+            AttributionType::AiAssisted => stats.ai_assisted_lines += lines,
+            AttributionType::Unknown | AttributionType::Manual => stats.unlinked_lines += lines,
+        }
+    }
+
+    stats
+}
+
+struct FileAttribution {
+    file_path: String,
+    total_lines: u32,
+    confidence: f32,
+    attribution_type: AttributionType,
+}
+
+fn aggregate_file_attributions(attributions: &[DiffAttribution]) -> Vec<FileAttribution> {
+    let mut map: HashMap<String, (u32, f32, AttributionType)> = HashMap::new();
+
+    for attr in attributions {
+        let lines = attr.hunk_end.saturating_sub(attr.hunk_start) + 1;
+        let entry = map.entry(attr.file_path.clone()).or_insert((0, 0.0, AttributionType::Unknown));
+        entry.0 += lines;
+        // Keep highest-confidence attribution
+        if attr.confidence > entry.1 {
+            entry.1 = attr.confidence;
+            entry.2 = attr.attribution_type.clone();
+        }
+    }
+
+    let mut result: Vec<FileAttribution> = map
+        .into_iter()
+        .map(|(file_path, (total_lines, confidence, attribution_type))| FileAttribution {
+            file_path,
+            total_lines,
+            confidence,
+            attribution_type,
+        })
+        .collect();
+
+    result.sort_by(|a, b| b.total_lines.cmp(&a.total_lines));
+    result
+}
+
+fn format_attribution_label(attr_type: &AttributionType, confidence: f32) -> String {
+    match attr_type {
+        AttributionType::AiGenerated => {
+            format!("\u{1f916} AI-generated ({:.0}%)", confidence * 100.0)
+        }
+        AttributionType::AiAssisted => {
+            format!("\u{1f916} AI-assisted ({:.0}%)", confidence * 100.0)
+        }
+        AttributionType::Manual => "Manual".to_string(),
+        AttributionType::Unknown => "Unlinked".to_string(),
+    }
 }
 
 fn truncate_for_table(text: &str, max_len: usize) -> String {
@@ -120,29 +209,49 @@ fn truncate_for_table(text: &str, max_len: usize) -> String {
 }
 
 fn format_files_touched(lineage: &[FileLineage], interaction_id: &str) -> String {
-    let files: Vec<String> = lineage
-        .iter()
-        .filter(|l| l.interaction_id == interaction_id)
-        .map(|l| {
-            let ops: Vec<&str> = l
-                .operations
-                .iter()
-                .map(|op| match op.op_type {
-                    FileOpType::Read => "R",
-                    FileOpType::Write => "W",
-                    FileOpType::ReadWrite => "RW",
-                })
-                .collect();
-            let op_str = ops.join(",");
-            let filename = l.file_path.rsplit('/').next().unwrap_or(&l.file_path);
-            format!("{} ({})", filename, op_str)
+    // Deduplicate: one entry per file with combined R/W label
+    let mut file_ops: HashMap<String, (bool, bool)> = HashMap::new();
+
+    for l in lineage.iter().filter(|l| l.interaction_id == interaction_id) {
+        let filename = l.file_path.rsplit('/').next().unwrap_or(&l.file_path).to_string();
+        let entry = file_ops.entry(filename).or_insert((false, false));
+        for op in &l.operations {
+            match op.op_type {
+                FileOpType::Read => entry.0 = true,
+                FileOpType::Write => entry.1 = true,
+                FileOpType::ReadWrite => {
+                    entry.0 = true;
+                    entry.1 = true;
+                }
+            }
+        }
+    }
+
+    if file_ops.is_empty() {
+        return "\u{2014}".to_string();
+    }
+
+    let mut files: Vec<(String, String)> = file_ops
+        .into_iter()
+        .map(|(name, (r, w))| {
+            let label = match (r, w) {
+                (true, true) => "R/W",
+                (true, false) => "R",
+                (false, true) => "W",
+                _ => "",
+            };
+            (name, label.to_string())
         })
         .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    if files.is_empty() {
-        "\u{2014}".to_string()
+    let max_shown = 3;
+    if files.len() <= max_shown {
+        files.iter().map(|(n, l)| format!("{} ({})", n, l)).collect::<Vec<_>>().join(", ")
     } else {
-        files.join(", ")
+        let shown: Vec<String> =
+            files[..max_shown].iter().map(|(n, l)| format!("{} ({})", n, l)).collect();
+        format!("{}, +{} more", shown.join(", "), files.len() - max_shown)
     }
 }
 
@@ -164,18 +273,7 @@ fn format_interaction_attribution(
         .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap();
 
-    let label = match best.attribution_type {
-        AttributionType::AiGenerated => "\u{1f916} AI-generated",
-        AttributionType::AiAssisted => "\u{1f9d1}\u{200d}\u{1f4bb} AI-assisted",
-        AttributionType::Manual => "\u{270d}\u{fe0f} Manual",
-        AttributionType::Unknown => "\u{2753} Unknown",
-    };
-
-    if best.confidence > 0.0 {
-        format!("{} ({:.0}%)", label, best.confidence * 100.0)
-    } else {
-        label.to_string()
-    }
+    format_attribution_label(&best.attribution_type, best.confidence)
 }
 
 #[cfg(test)]
@@ -209,6 +307,7 @@ mod tests {
                 }],
                 lineage: vec![],
                 duration: "5m".to_string(),
+                wall_time: None,
             }],
             attributions: vec![],
             llm_summary: None,
@@ -218,6 +317,7 @@ mod tests {
         assert!(comment.contains("1 AI session"));
         assert!(comment.contains("abcdef12"));
         assert!(comment.contains("Fix the upload bug"));
+        assert!(comment.contains("<details>"));
     }
 
     #[test]
@@ -239,5 +339,111 @@ mod tests {
         let truncated = truncate_for_table(&long, 60);
         assert!(truncated.ends_with("..."));
         assert!(truncated.len() <= 64); // 60 + "..."
+    }
+
+    #[test]
+    fn test_format_with_wall_time() {
+        let now = Utc::now();
+        let data = CommentData {
+            sessions: vec![SessionSummary {
+                session_id: "abcdef12-3456-7890".to_string(),
+                interactions: vec![Interaction {
+                    id: "abcdef12-1".to_string(),
+                    session_id: "abcdef12".to_string(),
+                    sequence: 1,
+                    prompt: "Fix bug".to_string(),
+                    response_texts: vec![],
+                    tool_calls: vec![],
+                    timestamp_start: now,
+                    timestamp_end: now,
+                }],
+                lineage: vec![],
+                duration: "6m".to_string(),
+                wall_time: Some("3h 6m".to_string()),
+            }],
+            attributions: vec![],
+            llm_summary: None,
+        };
+
+        let comment = format_comment(&data);
+        assert!(comment.contains("6m active"));
+        assert!(comment.contains("3h 6m wall"));
+    }
+
+    #[test]
+    fn test_format_attribution_stats() {
+        let data = CommentData {
+            sessions: vec![],
+            attributions: vec![
+                DiffAttribution {
+                    commit_sha: String::new(),
+                    file_path: "src/main.rs".to_string(),
+                    hunk_start: 1,
+                    hunk_end: 10,
+                    interaction_id: Some("s-1".to_string()),
+                    confidence: 0.9,
+                    attribution_type: AttributionType::AiGenerated,
+                },
+                DiffAttribution {
+                    commit_sha: String::new(),
+                    file_path: "src/lib.rs".to_string(),
+                    hunk_start: 1,
+                    hunk_end: 5,
+                    interaction_id: None,
+                    confidence: 0.0,
+                    attribution_type: AttributionType::Unknown,
+                },
+            ],
+            llm_summary: None,
+        };
+
+        let comment = format_comment(&data);
+        assert!(comment.contains("AI-generated"));
+        assert!(comment.contains("Unlinked"));
+        assert!(comment.contains("<details>"));
+        assert!(comment.contains("Diff attribution"));
+    }
+
+    #[test]
+    fn test_files_touched_dedup() {
+        let lineage = vec![FileLineage {
+            interaction_id: "test-1".to_string(),
+            file_path: "/src/main.rs".to_string(),
+            operations: vec![
+                crate::provenance::lineage::FileOp {
+                    op_type: FileOpType::Read,
+                    tool_call_sequence: 1,
+                    content_snippet: String::new(),
+                },
+                crate::provenance::lineage::FileOp {
+                    op_type: FileOpType::Write,
+                    tool_call_sequence: 2,
+                    content_snippet: String::new(),
+                },
+            ],
+        }];
+
+        let result = format_files_touched(&lineage, "test-1");
+        assert!(result.contains("main.rs (R/W)"));
+        // Should NOT have duplicate entries
+        assert_eq!(result.matches("main.rs").count(), 1);
+    }
+
+    #[test]
+    fn test_files_touched_truncation() {
+        let lineage: Vec<FileLineage> = (1..=5)
+            .map(|i| FileLineage {
+                interaction_id: "test-1".to_string(),
+                file_path: format!("/src/file{}.rs", i),
+                operations: vec![crate::provenance::lineage::FileOp {
+                    op_type: FileOpType::Read,
+                    tool_call_sequence: 1,
+                    content_snippet: String::new(),
+                }],
+            })
+            .collect();
+
+        let result = format_files_touched(&lineage, "test-1");
+        assert!(result.contains("+2 more"));
     }
 }
