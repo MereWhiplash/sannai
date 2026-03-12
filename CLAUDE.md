@@ -8,9 +8,9 @@ AI code provenance tool. Captures AI coding sessions on the developer's machine 
 
 ## Architecture
 
-Single component: **agent/** (Rust) — Local daemon. Watches Claude Code JSONL session files, parses events, stores in SQLite, links git commits, posts PR comments. Local API on `:9847`. Fully implemented with 31+ tests.
+Single component: **agent/** (Rust) — Local daemon. Watches Claude Code JSONL session files, parses events, stores in SQLite, links git commits, computes diff attribution, posts PR comments with provenance summaries. Local API on `:9847`. 79 tests.
 
-Data flow: agent watches `~/.claude/projects/` JSONL files -> parses -> stores in SQLite -> links to git commits.
+Data flow: agent watches `~/.claude/projects/` JSONL files -> parses -> stores in SQLite -> links to git commits -> attributes diffs to AI interactions -> posts PR comments.
 
 ## Build Commands
 

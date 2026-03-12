@@ -53,6 +53,19 @@ The daemon runs a local API on `127.0.0.1:9847` with endpoints:
 - `GET /sessions/{id}/events` — session events
 - `POST /hook/commit` — link commits to active sessions
 
+## Configuration
+
+Optional config at `~/.config/sannai/config.toml`:
+
+```toml
+[summary]
+enabled = true                                    # Enable LLM-generated summaries
+command = "CLAUDECODE= claude -p --model haiku"   # Command that accepts prompt on stdin
+max_length = 2000                                 # Max summary length in chars
+```
+
+When enabled, `sannai comment` pipes structured session data to the configured command and includes the LLM's narrative summary in the PR comment.
+
 ## Prerequisites
 
 - Rust (stable)
@@ -67,7 +80,7 @@ Sannai includes a Claude Code skill at `skills/provenance/` that teaches Claude 
 
 ```bash
 make build          # cargo build
-make test           # cargo test (31+ tests)
+make test           # cargo test (79 tests)
 make lint           # cargo clippy -- -D warnings
 make fmt            # cargo fmt
 make manual-test    # Generate fake session data and test the agent

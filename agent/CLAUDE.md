@@ -1,18 +1,21 @@
 # Agent — sannai (Rust)
 
-Local daemon that captures Claude Code sessions. Binary name: `sannai`.
+Local daemon that captures Claude Code sessions and posts provenance comments on PRs. Binary name: `sannai`.
 
 ## Commands
 
 ```bash
 cargo build
-cargo test                        # All 31+ tests
+cargo test                        # All 79 tests
 cargo test test_parse_user        # Single test by name
 cargo clippy -- -D warnings       # Lint (CI treats warnings as errors)
 cargo fmt                         # Format (max_width=100, see rustfmt.toml)
 cargo run -- start                # Run daemon in foreground
 cargo run -- status               # Check if daemon is running
 cargo run -- sessions             # List captured sessions
+cargo run -- comment --pr <url>   # Post provenance comment on a PR
+cargo run -- install              # Register as system service
+cargo run -- uninstall [--purge]  # Remove service (and optionally data)
 ```
 
 ## Architecture
@@ -31,13 +34,25 @@ Shared state: `Store` and `SessionManager` are wrapped in `Arc<Mutex<_>>` and pa
 watcher -> parser -> session -> store
                                   ^
                             api --+
+                            comment (PR posting, uses provenance/)
 ```
 
+### Core pipeline
 - **parser** — `parse_line()` converts a JSONL line into `Vec<ParsedEvent>`. One line can produce multiple events (e.g., assistant message with text + tool_use). Handles: `queue-operation`, `user`, `assistant`. Ignores: `progress`, `system`.
 - **watcher** — `FileWatcher` classifies paths as `MainSession` or `Subagent` based on directory depth. Persists file byte offsets for resume after restart.
-- **session** — `SessionManager.ensure_session()` creates or updates sessions. `process_event()` maps `ParsedEvent` variants to store operations.
+- **session** — `SessionManager.ensure_session()` creates or updates sessions. `process_event()` maps `ParsedEvent` variants to store operations. Stores tool_id/input on tool_use events and content on tool_result events for provenance.
 - **store** — SQLite with WAL mode. Tables: `sessions`, `events`, `commit_links`. All timestamps stored as RFC 3339 strings. Uses `upsert` (INSERT ... ON CONFLICT) for sessions.
 - **daemon** — PID file management, data dir paths, signal handling. Override dirs with `SANNAI_DATA_DIR` and `SANNAI_CLAUDE_DIR` env vars.
+
+### Provenance & commenting
+- **provenance/interaction** — Groups raw events into logical interactions (prompt → response cycle). Filters noise (confirmations, slash commands, internal tags).
+- **provenance/lineage** — Extracts file-level lineage from tool calls (which files were read/written per interaction).
+- **provenance/attribution** — Matches PR diff hunks to interactions via content similarity, with file-level fallback for when tool call content is truncated.
+- **provenance/summary** — Optional LLM summary generation. Builds structured prompt from session data, pipes to configurable command.
+- **comment/format** — Renders provenance data as a GitHub markdown comment with attribution stats, per-session interaction tables, and diff attribution.
+- **comment/github** — `gh` CLI wrapper for fetching PR data and posting/updating comments.
+- **config** — Loads `~/.config/sannai/config.toml` for summary settings.
+- **service** — Cross-platform daemon installer (launchd on macOS, systemd on Linux).
 
 ## API Endpoints (local, :9847)
 

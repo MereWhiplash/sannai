@@ -17,7 +17,7 @@ pub struct SummaryConfig {
 
 impl Default for SummaryConfig {
     fn default() -> Self {
-        Self { enabled: false, command: String::new(), max_length: 500 }
+        Self { enabled: false, command: String::new(), max_length: 2000 }
     }
 }
 
@@ -142,7 +142,7 @@ fn build_prompt(bundle: &ProvenanceBundle) -> String {
 
         let total = ai_gen_lines + ai_assist_lines + unknown_lines;
         prompt.push_str(&format!(
-            "- AI-generated: {} lines ({}%)\n- AI-assisted: {} lines ({}%)\n- Unlinked/manual: {} lines ({}%)\n\n",
+            "- AI-generated (high confidence match): {} lines ({}%)\n- AI-assisted (file-level match): {} lines ({}%)\n- Unattributed (no matching session data): {} lines ({}%)\n\n",
             ai_gen_lines, if total > 0 { ai_gen_lines * 100 / total } else { 0 },
             ai_assist_lines, if total > 0 { ai_assist_lines * 100 / total } else { 0 },
             unknown_lines, if total > 0 { unknown_lines * 100 / total } else { 0 },
@@ -190,9 +190,13 @@ fn build_prompt(bundle: &ProvenanceBundle) -> String {
          Write a concise summary (3-5 sentences) for a code reviewer. Address:\n\
          1. What the developer accomplished and their approach\n\
          2. Whether the work was straightforward or required multiple iterations/corrections\n\
-         3. The balance of AI-generated vs human-written code\n\
-         4. Any areas a reviewer should scrutinize (e.g., files with low attribution confidence, \
-            complex logic that was AI-generated, or patterns suggesting the AI struggled)\n\n\
+         3. How much of the code was AI-generated or AI-assisted\n\
+         4. Any areas a reviewer should scrutinize (e.g., complex logic, patterns suggesting \
+            the AI struggled, or areas that needed multiple attempts)\n\n\
+         IMPORTANT: All code produced during an AI coding session should be considered \
+         AI-generated, even if attribution is \"unattributed\" — that label means the \
+         tool couldn't match the exact content, NOT that the code was written manually. \
+         If sessions exist, assume the developer used AI for the work.\n\n\
          Do NOT list files or repeat raw numbers. Synthesize the data into a narrative.\n",
     );
 
@@ -321,7 +325,7 @@ mod tests {
             attributions: vec![],
             diff: String::new(),
         };
-        let config = SummaryConfig { enabled: false, command: "echo test".to_string(), max_length: 500 };
+        let config = SummaryConfig { enabled: false, command: "echo test".to_string(), max_length: 2000 };
         assert!(generate_summary(&bundle, &config).is_none());
     }
 

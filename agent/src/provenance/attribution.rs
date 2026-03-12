@@ -220,7 +220,8 @@ fn match_hunk_to_interaction(
     }
 
     let added_text = hunk.added_lines.join("\n");
-    let mut best_match: Option<(String, f32)> = None;
+    let mut best_content_match: Option<(String, f32)> = None;
+    let mut file_level_match: Option<String> = None;
 
     for interaction in interactions {
         for tc in &interaction.tool_calls {
@@ -245,27 +246,57 @@ fn match_hunk_to_interaction(
                 continue;
             }
 
+            // File-level match: an AI interaction wrote to this file
+            if file_level_match.is_none() {
+                file_level_match = Some(interaction.id.clone());
+            }
+
             let written = get_written_content(tc);
             if written.is_empty() {
                 continue;
             }
 
             let similarity = compute_similarity(&added_text, &written);
-            if let Some((_, best_sim)) = &best_match {
+            if let Some((_, best_sim)) = &best_content_match {
                 if similarity > *best_sim {
-                    best_match = Some((interaction.id.clone(), similarity));
+                    best_content_match = Some((interaction.id.clone(), similarity));
                 }
             } else if similarity > 0.1 {
-                best_match = Some((interaction.id.clone(), similarity));
+                best_content_match = Some((interaction.id.clone(), similarity));
             }
         }
     }
 
-    match best_match {
-        Some((id, conf)) if conf >= 0.7 => (Some(id), conf, AttributionType::AiGenerated),
-        Some((id, conf)) if conf >= 0.3 => (Some(id), conf, AttributionType::AiAssisted),
-        _ => (None, 0.0, AttributionType::Unknown),
+    // First: content-level matching (high confidence)
+    match best_content_match {
+        Some((id, conf)) if conf >= 0.7 => return (Some(id), conf, AttributionType::AiGenerated),
+        Some((id, conf)) if conf >= 0.3 => return (Some(id), conf, AttributionType::AiAssisted),
+        _ => {}
     }
+
+    // Fallback: file-level matching — an AI interaction wrote/edited this file,
+    // even if we can't match the exact content (truncated inputs, multiple edits, etc.)
+    if let Some(id) = file_level_match {
+        return (Some(id), 0.5, AttributionType::AiAssisted);
+    }
+
+    // No match at all — but if ANY interaction exists, the code was produced during
+    // an AI session. Check if the file was at least read by an interaction.
+    for interaction in interactions {
+        for tc in &interaction.tool_calls {
+            let tc_path = tc
+                .input
+                .get("file_path")
+                .or_else(|| tc.input.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if paths_match(tc_path, &hunk.file_path) {
+                return (Some(interaction.id.clone()), 0.3, AttributionType::AiAssisted);
+            }
+        }
+    }
+
+    (None, 0.0, AttributionType::Unknown)
 }
 
 fn paths_match(tc_path: &str, diff_path: &str) -> bool {
