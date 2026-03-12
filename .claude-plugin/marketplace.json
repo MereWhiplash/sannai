@@ -1,0 +1,17 @@
+{
+  "name": "sannai-marketplace",
+  "owner": {
+    "name": "MereWhiplash"
+  },
+  "metadata": {
+    "description": "Sannai AI code provenance tools for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "sannai",
+      "source": ".",
+      "description": "AI code provenance — captures coding sessions and posts summaries on PRs",
+      "version": "0.1.0"
+    }
+  ]
+}

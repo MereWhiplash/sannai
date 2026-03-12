@@ -1,9 +1,14 @@
 [package]
-name = "sannai-agent"
+name = "sannai"
 version = "0.1.0"
 edition = "2021"
 description = "Local daemon for AI coding session capture"
 license = "MIT"
+repository = "https://github.com/MereWhiplash/sannai"
+homepage = "https://github.com/MereWhiplash/sannai"
+keywords = ["ai", "provenance", "code-review", "claude", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../README.md"
 
 [[bin]]
 name = "sannai"

@@ -3,7 +3,7 @@
 //! Feeds every line from a captured session through the parser to find
 //! crashes, unexpected errors, or event types we're not handling.
 
-use sannai_agent::parser;
+use sannai::parser;
 use std::fs;
 
 #[test]

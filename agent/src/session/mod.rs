@@ -1,13 +1,10 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::git;
-use crate::git::observer::GitObserverCommand;
-use crate::git::tool_detect;
 use crate::parser::ParsedEvent;
 use crate::store::{self, Store};
 use crate::watcher::WatcherEvent;
@@ -21,6 +18,7 @@ struct ActiveSession {
     id: String,
     project_path: Option<String>,
     cwd: Option<String>,
+    git_branch: Option<String>,
     started_at: DateTime<Utc>,
     last_event_at: DateTime<Utc>,
     prompt_count: u64,
@@ -35,9 +33,6 @@ pub struct SessionManager {
     store: Arc<Mutex<Store>>,
     active_sessions: HashMap<String, ActiveSession>,
     idle_timeout: Duration,
-    git_cmd_tx: Option<mpsc::Sender<GitObserverCommand>>,
-    /// Tool IDs of Bash tool_use calls that contained git commands
-    pending_git_tool_ids: HashSet<String>,
 }
 
 impl SessionManager {
@@ -46,13 +41,7 @@ impl SessionManager {
             store,
             active_sessions: HashMap::new(),
             idle_timeout: Duration::minutes(idle_timeout_minutes),
-            git_cmd_tx: None,
-            pending_git_tool_ids: HashSet::new(),
         }
-    }
-
-    pub fn set_git_cmd_tx(&mut self, tx: mpsc::Sender<GitObserverCommand>) {
-        self.git_cmd_tx = Some(tx);
     }
 
     /// Main run loop. Consumes events from the watcher and periodically checks for idle sessions.
@@ -106,28 +95,13 @@ impl SessionManager {
     }
 
     async fn process_event(&mut self, watcher_event: WatcherEvent) -> Result<()> {
-        let WatcherEvent {
-            parsed,
-            project_dir,
-            ..
-        } = watcher_event;
+        let WatcherEvent { parsed, project_dir, .. } = watcher_event;
 
         match &parsed {
-            ParsedEvent::SessionStart {
-                session_id,
-                timestamp,
-            } => {
-                self.ensure_session(session_id, *timestamp, &project_dir, None, None)
-                    .await?;
+            ParsedEvent::SessionStart { session_id, timestamp } => {
+                self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
             }
-            ParsedEvent::UserPrompt {
-                session_id,
-                timestamp,
-                content,
-                cwd,
-                git_branch,
-                ..
-            } => {
+            ParsedEvent::UserPrompt { session_id, timestamp, content, cwd, git_branch, .. } => {
                 self.ensure_session(
                     session_id,
                     *timestamp,
@@ -155,8 +129,7 @@ impl SessionManager {
                 output_tokens,
                 ..
             } => {
-                self.ensure_session(session_id, *timestamp, &project_dir, None, None)
-                    .await?;
+                self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
 
                 let metadata = serde_json::json!({
                     "model": model,
@@ -178,16 +151,8 @@ impl SessionManager {
                     active.last_event_at = *timestamp;
                 }
             }
-            ParsedEvent::ToolUse {
-                session_id,
-                timestamp,
-                tool_name,
-                tool_id,
-                input,
-                ..
-            } => {
-                self.ensure_session(session_id, *timestamp, &project_dir, None, None)
-                    .await?;
+            ParsedEvent::ToolUse { session_id, timestamp, tool_name, tool_id, input, .. } => {
+                self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
 
                 let metadata = serde_json::json!({
                     "tool_id": tool_id,
@@ -203,15 +168,6 @@ impl SessionManager {
                 )
                 .await?;
 
-                // Check if this is a Bash tool call with a git command
-                if tool_name == "Bash" {
-                    if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-                        if tool_detect::detect_git_command(command).is_some() {
-                            self.pending_git_tool_ids.insert(tool_id.clone());
-                        }
-                    }
-                }
-
                 if let Some(active) = self.active_sessions.get_mut(session_id) {
                     active.event_count += 1;
                     active.last_event_at = *timestamp;
@@ -225,8 +181,7 @@ impl SessionManager {
                 content,
                 ..
             } => {
-                self.ensure_session(session_id, *timestamp, &project_dir, None, None)
-                    .await?;
+                self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
 
                 let metadata = serde_json::json!({
                     "tool_use_id": tool_use_id,
@@ -241,13 +196,6 @@ impl SessionManager {
                     Some(metadata),
                 )
                 .await?;
-
-                // If this result is for a git tool call and it succeeded, trigger immediate poll
-                if !is_error && self.pending_git_tool_ids.remove(tool_use_id) {
-                    if let Some(ref git_tx) = self.git_cmd_tx {
-                        let _ = git_tx.try_send(GitObserverCommand::ImmediatePoll);
-                    }
-                }
 
                 if let Some(active) = self.active_sessions.get_mut(session_id) {
                     active.event_count += 1;
@@ -266,52 +214,55 @@ impl SessionManager {
         timestamp: DateTime<Utc>,
         project_dir: &str,
         cwd: Option<&str>,
-        _git_branch: Option<&str>,
+        git_branch: Option<&str>,
     ) -> Result<()> {
         if self.active_sessions.contains_key(session_id) {
-            // Update cwd if we got a new one
-            if let Some(cwd) = cwd {
-                if let Some(active) = self.active_sessions.get_mut(session_id) {
+            let needs_store_update;
+            if let Some(active) = self.active_sessions.get_mut(session_id) {
+                let mut changed = false;
+                if let Some(cwd) = cwd {
                     if active.cwd.is_none() {
                         active.cwd = Some(cwd.to_string());
                         active.project_path = Some(cwd.to_string());
-                        // Update store too
-                        let session = store::Session {
-                            id: session_id.to_string(),
-                            tool: "claude_code".to_string(),
-                            project_path: Some(cwd.to_string()),
-                            started_at: active.started_at,
-                            ended_at: None,
-                            synced_at: None,
-                            metadata: None,
-                        };
-                        self.store.lock().await.upsert_session(&session)?;
-
-                        // Now that we have the real cwd, track the git repo
-                        if let Some(ref git_tx) = self.git_cmd_tx {
-                            let path = std::path::Path::new(cwd);
-                            if let Some(repo_path) = git::discover_repo(path) {
-                                let _ = git_tx.try_send(GitObserverCommand::TrackRepo {
-                                    repo_path,
-                                    session_id: session_id.to_string(),
-                                });
-                            }
-                        }
+                        changed = true;
                     }
                 }
+                if let Some(branch) = git_branch {
+                    if active.git_branch.is_none() {
+                        active.git_branch = Some(branch.to_string());
+                        changed = true;
+                    }
+                }
+                needs_store_update = changed;
+                if changed {
+                    let session = store::Session {
+                        id: session_id.to_string(),
+                        tool: "claude_code".to_string(),
+                        project_path: active.project_path.clone(),
+                        git_branch: active.git_branch.clone(),
+                        started_at: active.started_at,
+                        ended_at: None,
+                        synced_at: None,
+                        metadata: None,
+                    };
+                    self.store.lock().await.upsert_session(&session)?;
+                }
+            } else {
+                needs_store_update = false;
             }
+            let _ = needs_store_update;
             return Ok(());
         }
 
         // New session
-        let project_path = cwd
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| project_dir.replace('-', "/"));
+        let project_path =
+            cwd.map(|s| s.to_string()).unwrap_or_else(|| project_dir.replace('-', "/"));
 
         let session = store::Session {
             id: session_id.to_string(),
             tool: "claude_code".to_string(),
             project_path: Some(project_path.clone()),
+            git_branch: git_branch.map(|s| s.to_string()),
             started_at: timestamp,
             ended_at: None,
             synced_at: None,
@@ -320,36 +271,21 @@ impl SessionManager {
 
         self.store.lock().await.upsert_session(&session)?;
 
-        tracing::info!(
-            "New session: {} (project: {})",
-            session_id,
-            project_path
-        );
+        tracing::info!("New session: {} (project: {})", session_id, project_path);
 
         self.active_sessions.insert(
             session_id.to_string(),
             ActiveSession {
                 id: session_id.to_string(),
-                project_path: Some(project_path.clone()),
+                project_path: Some(project_path),
                 cwd: cwd.map(|s| s.to_string()),
+                git_branch: git_branch.map(|s| s.to_string()),
                 started_at: timestamp,
                 last_event_at: timestamp,
                 prompt_count: 0,
                 event_count: 0,
             },
         );
-
-        // If the project path is a git repo, tell the observer to track it
-        if let Some(ref git_tx) = self.git_cmd_tx {
-            let path = std::path::Path::new(&project_path);
-            if let Some(repo_path) = git::discover_repo(path) {
-                let _ = git_tx
-                    .try_send(GitObserverCommand::TrackRepo {
-                        repo_path,
-                        session_id: session_id.to_string(),
-                    });
-            }
-        }
 
         Ok(())
     }
@@ -394,17 +330,7 @@ impl SessionManager {
 
     async fn end_session(&mut self, session_id: &str) -> Result<()> {
         if let Some(active) = self.active_sessions.remove(session_id) {
-            self.store
-                .lock()
-                .await
-                .end_session(session_id, active.last_event_at)?;
-
-            if let Some(ref git_tx) = self.git_cmd_tx {
-                let _ = git_tx.try_send(GitObserverCommand::UntrackSession {
-                    session_id: session_id.to_string(),
-                });
-            }
-
+            self.store.lock().await.end_session(session_id, active.last_event_at)?;
             tracing::info!(
                 "Session ended: {} ({} events, {} prompts)",
                 session_id,
@@ -429,14 +355,8 @@ impl SessionManager {
         self.active_sessions
             .values()
             .filter(|s| {
-                s.project_path
-                    .as_deref()
-                    .map(|p| p == repo_path)
-                    .unwrap_or(false)
-                    || s.cwd
-                        .as_deref()
-                        .map(|c| c == repo_path)
-                        .unwrap_or(false)
+                s.project_path.as_deref().map(|p| p == repo_path).unwrap_or(false)
+                    || s.cwd.as_deref().map(|c| c == repo_path).unwrap_or(false)
             })
             .map(|s| s.id.clone())
             .collect()
@@ -536,11 +456,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = store
-            .lock()
-            .await
-            .get_events_for_session("sess-2")
-            .unwrap();
+        let events = store.lock().await.get_events_for_session("sess-2").unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].event_type, "user_prompt");
         assert_eq!(events[1].event_type, "assistant_response");
@@ -572,142 +488,8 @@ mod tests {
 
         assert!(!mgr.active_sessions.contains_key("old-sess"));
 
-        let session = store
-            .lock()
-            .await
-            .get_session("old-sess")
-            .unwrap()
-            .unwrap();
+        let session = store.lock().await.get_session("old-sess").unwrap().unwrap();
         assert!(session.ended_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_session_manager_sends_track_command() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let store = Arc::new(Mutex::new(Store::open(&db_path).unwrap()));
-
-        let (git_cmd_tx, mut git_cmd_rx) =
-            mpsc::channel::<crate::git::observer::GitObserverCommand>(10);
-        let mut mgr = SessionManager::new(store.clone(), 10);
-        mgr.set_git_cmd_tx(git_cmd_tx);
-
-        // Create a real temp git repo
-        let repo_dir = init_test_repo_for_session();
-
-        let now = Utc::now();
-        let event = make_watcher_event(ParsedEvent::UserPrompt {
-            session_id: "git-sess".to_string(),
-            uuid: "u-1".to_string(),
-            timestamp: now,
-            content: "Hello".to_string(),
-            cwd: Some(repo_dir.path().to_string_lossy().to_string()),
-            git_branch: Some("main".to_string()),
-        });
-
-        mgr.process_event(event).await.unwrap();
-
-        // Should have sent a TrackRepo command
-        let cmd = git_cmd_rx.try_recv().unwrap();
-        match cmd {
-            crate::git::observer::GitObserverCommand::TrackRepo { session_id, .. } => {
-                assert_eq!(session_id, "git-sess");
-            }
-            _ => panic!("Expected TrackRepo"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_git_bash_triggers_poll() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let store = Arc::new(Mutex::new(Store::open(&db_path).unwrap()));
-
-        let (git_cmd_tx, mut git_cmd_rx) =
-            mpsc::channel::<crate::git::observer::GitObserverCommand>(10);
-        let mut mgr = SessionManager::new(store.clone(), 10);
-        mgr.set_git_cmd_tx(git_cmd_tx);
-
-        let repo_dir = init_test_repo_for_session();
-        let now = Utc::now();
-
-        // First create a session
-        mgr.process_event(make_watcher_event(ParsedEvent::UserPrompt {
-            session_id: "git-poll-sess".to_string(),
-            uuid: "u-1".to_string(),
-            timestamp: now,
-            content: "Hello".to_string(),
-            cwd: Some(repo_dir.path().to_string_lossy().to_string()),
-            git_branch: Some("main".to_string()),
-        }))
-        .await
-        .unwrap();
-
-        // Drain the TrackRepo command
-        let _ = git_cmd_rx.try_recv();
-
-        // Send a Bash tool_use with git commit
-        mgr.process_event(make_watcher_event(ParsedEvent::ToolUse {
-            session_id: "git-poll-sess".to_string(),
-            uuid: "a-1".to_string(),
-            timestamp: now + Duration::seconds(1),
-            tool_name: "Bash".to_string(),
-            tool_id: "toolu_git_01".to_string(),
-            input: serde_json::json!({"command": "git commit -m 'test'"}),
-        }))
-        .await
-        .unwrap();
-
-        // No poll yet — tool hasn't completed
-        assert!(git_cmd_rx.try_recv().is_err());
-
-        // Send successful tool result
-        mgr.process_event(make_watcher_event(ParsedEvent::ToolResult {
-            session_id: "git-poll-sess".to_string(),
-            uuid: "a-1".to_string(),
-            timestamp: now + Duration::seconds(2),
-            tool_use_id: "toolu_git_01".to_string(),
-            is_error: false,
-            content: Some("1 file changed".to_string()),
-        }))
-        .await
-        .unwrap();
-
-        // Should have sent ImmediatePoll
-        let cmd = git_cmd_rx.try_recv().unwrap();
-        assert!(matches!(cmd, crate::git::observer::GitObserverCommand::ImmediatePoll));
-    }
-
-    fn init_test_repo_for_session() -> tempfile::TempDir {
-        use std::process::Command;
-        let dir = tempfile::TempDir::new().unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::fs::write(dir.path().join("README.md"), "# test").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        dir
     }
 
     #[tokio::test]

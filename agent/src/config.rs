@@ -20,16 +20,12 @@ pub struct SummarySection {
 
 impl Default for SummarySection {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            command: String::new(),
-            max_length: 500,
-        }
+        Self { enabled: false, command: String::new(), max_length: 2000 }
     }
 }
 
 fn default_max_length() -> usize {
-    500
+    2000
 }
 
 /// Load config from `~/.config/sannai/config.toml`, falling back to defaults.
@@ -59,8 +55,5 @@ fn config_path() -> PathBuf {
         return PathBuf::from(path);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".config")
-        .join("sannai")
-        .join("config.toml")
+    PathBuf::from(home).join(".config").join("sannai").join("config.toml")
 }

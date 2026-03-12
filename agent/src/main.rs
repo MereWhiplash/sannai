@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use sannai_agent::{api, comment, daemon, git, session, store, watcher};
+use sannai::{api, comment, config, daemon, provenance, service, session, store, watcher};
 
 #[derive(Parser)]
 #[command(name = "sannai")]
@@ -33,6 +33,14 @@ enum Commands {
         #[arg(long, default_value = "20")]
         limit: u32,
     },
+    /// Install sannai as a system service (launchd on macOS, systemd on Linux)
+    Install,
+    /// Uninstall the sannai system service
+    Uninstall {
+        /// Also remove all stored data (sessions, database)
+        #[arg(long)]
+        purge: bool,
+    },
     /// Post provenance comment on a GitHub PR
     Comment {
         /// PR URL (e.g., https://github.com/owner/repo/pull/123)
@@ -50,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sannai_agent=info".into()),
+                .unwrap_or_else(|_| "sannai=info".into()),
         )
         .init();
 
@@ -63,10 +71,32 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop => {
             daemon::stop_daemon()?;
         }
-        Commands::Status => match daemon::daemon_status() {
-            Some(pid) => println!("sannai daemon: running (PID {})", pid),
-            None => println!("sannai daemon: not running"),
-        },
+        Commands::Install => {
+            service::install_service()?;
+        }
+        Commands::Uninstall { purge } => {
+            service::uninstall_service(purge)?;
+        }
+        Commands::Status => {
+            match daemon::daemon_status() {
+                Some(pid) => println!("sannai daemon: running (PID {})", pid),
+                None => println!("sannai daemon: not running"),
+            }
+            println!(
+                "Service installed: {}",
+                if service::is_service_installed() { "yes" } else { "no" }
+            );
+            let data_dir = daemon::data_dir();
+            println!("Data directory: {}", data_dir.display());
+            let db_path = data_dir.join("store.db");
+            if db_path.exists() {
+                if let Ok(s) = store::Store::open(&db_path) {
+                    if let Ok(sessions) = s.list_sessions(u32::MAX, 0) {
+                        println!("Sessions captured: {}", sessions.len());
+                    }
+                }
+            }
+        }
         Commands::Sessions { limit } => {
             let db_path = daemon::data_dir().join("store.db");
             if !db_path.exists() {
@@ -78,10 +108,7 @@ async fn main() -> anyhow::Result<()> {
             if sessions.is_empty() {
                 println!("No sessions captured yet.");
             } else {
-                println!(
-                    "{:<38} {:<12} {:<40} STARTED",
-                    "SESSION ID", "TOOL", "PROJECT"
-                );
+                println!("{:<38} {:<12} {:<40} STARTED", "SESSION ID", "TOOL", "PROJECT");
                 println!("{}", "-".repeat(110));
                 for session in &sessions {
                     println!(
@@ -104,15 +131,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
-    let repo_path = repo_path
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string())
-        });
+    let repo_path = repo_path.map(|s| s.to_string()).unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
 
-    // 1. Get PR commit SHAs
+    // 1. Load config
+    let cfg = config::load_config();
+
+    // 2. Get PR commit SHAs
     println!("Fetching PR commits...");
     let commit_shas = comment::github::get_pr_commits(pr_url)?;
     if commit_shas.is_empty() {
@@ -121,30 +149,62 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
     }
     println!("Found {} commit(s)", commit_shas.len());
 
-    // 2. Open store and find linked sessions
+    // 3. Open store and find linked sessions
     let db_path = daemon::data_dir().join("store.db");
     if !db_path.exists() {
         anyhow::bail!("No Sannai database found. Has the agent been running?");
     }
-    let s = store::Store::open(&db_path)?;
+    let store = store::Store::open(&db_path)?;
 
     let mut session_ids = HashSet::new();
     for sha in &commit_shas {
-        for sess in s.get_sessions_for_commit(sha)? {
-            session_ids.insert(sess.id);
+        for s in store.get_sessions_for_commit(sha)? {
+            session_ids.insert(s.id);
         }
     }
 
-    // Fallback: match sessions by repo path
+    // Fallback: timestamp matching only when no commit links exist at all
     if session_ids.is_empty() {
-        println!("No commit-linked sessions found, trying project path matching...");
-        for sess in s.list_sessions(100, 0)? {
-            if let Some(proj) = &sess.project_path {
-                if proj == &repo_path
+        println!("No commit-linked sessions found, trying timestamp matching...");
+        let commit_times = comment::github::get_pr_commit_times(pr_url)?;
+        let pr_branch = comment::github::get_pr_head_branch(pr_url)?;
+        if let Some(ref branch) = pr_branch {
+            println!("PR head branch: {}", branch);
+        }
+        println!("Matching {} commit timestamps against sessions...", commit_times.len());
+
+        // Small tolerance for clock skew between git and sannai timestamps
+        let tolerance = chrono::Duration::minutes(5);
+
+        for session in store.list_sessions(1000, 0)? {
+            if let Some(proj) = &session.project_path {
+                let path_match = proj == &repo_path
                     || repo_path.ends_with(proj)
                     || proj.ends_with(&repo_path)
-                {
-                    session_ids.insert(sess.id);
+                    || proj.starts_with(&format!("{}/", repo_path))
+                    || repo_path.starts_with(&format!("{}/", proj));
+                if !path_match {
+                    continue;
+                }
+                // Filter by branch: if both PR branch and session branch are known, they must match
+                if let (Some(ref pr_br), Some(ref sess_br)) = (&pr_branch, &session.git_branch) {
+                    if pr_br != sess_br {
+                        continue;
+                    }
+                }
+                // For unclosed sessions, use last event time instead of "now"
+                let session_end = match session.ended_at {
+                    Some(t) => t,
+                    None => store
+                        .get_last_event_time(&session.id)?
+                        .unwrap_or(session.started_at),
+                };
+                // Check if any commit was made during this session's active period
+                let has_commit_during_session = commit_times.iter().any(|ct| {
+                    *ct >= session.started_at - tolerance && *ct <= session_end + tolerance
+                });
+                if has_commit_during_session {
+                    session_ids.insert(session.id);
                 }
             }
         }
@@ -158,79 +218,107 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
 
     println!("Found {} session(s) with provenance data", session_ids.len());
 
-    // 3. Aggregate process metrics across sessions and commits
-    let mut total_interactions: i32 = 0;
-    let mut total_steering: f64 = 0.0;
-    let mut total_exploration: f64 = 0.0;
-    let mut total_specificity: f64 = 0.0;
-    let mut total_error_cycles: i32 = 0;
-    let mut total_files_read: i32 = 0;
-    let mut total_files_written: i32 = 0;
-    let mut all_red_flags: Vec<String> = Vec::new();
-    let mut test_behaviors: Vec<String> = Vec::new();
-    let mut metrics_count: usize = 0;
+    // 4. Build interactions and lineage per session
+    let mut all_interactions = Vec::new();
+    let mut all_lineage = Vec::new();
+    let mut session_summaries = Vec::new();
 
     for session_id in &session_ids {
-        let metrics = s.get_process_metrics_for_session(session_id)?;
-        for pm in &metrics {
-            metrics_count += 1;
-            total_interactions += pm.total_interactions;
-            total_steering += pm.steering_ratio;
-            total_exploration += pm.exploration_score;
-            total_specificity += pm.prompt_specificity;
-            total_error_cycles += pm.error_fix_cycles;
-            total_files_read += pm.files_read;
-            total_files_written += pm.files_written;
-            test_behaviors.push(pm.test_behavior.clone());
-            if let Some(flags) = pm.red_flags.as_array() {
-                for flag in flags {
-                    if let Some(f) = flag.as_str() {
-                        if !all_red_flags.contains(&f.to_string()) {
-                            all_red_flags.push(f.to_string());
-                        }
-                    }
-                }
-            }
+        let events = store.get_events_for_session(session_id)?;
+        let interactions = provenance::interaction::build_interactions(session_id, &events);
+
+        let mut session_lineage = Vec::new();
+        for interaction in &interactions {
+            session_lineage.extend(provenance::lineage::build_lineage(interaction));
         }
+
+        // Active time = sum of individual interaction durations
+        let active_duration: chrono::Duration = interactions
+            .iter()
+            .map(|i| i.timestamp_end - i.timestamp_start)
+            .fold(chrono::Duration::zero(), |acc, d| acc + d);
+        let duration = format_duration(active_duration);
+
+        // Wall time = first start to last end
+        let wall_time =
+            if let (Some(first), Some(last)) = (interactions.first(), interactions.last()) {
+                let wall = last.timestamp_end - first.timestamp_start;
+                let wall_secs = wall.num_seconds();
+                let active_secs = active_duration.num_seconds();
+                // Only show wall time when it's > 2x active time and > 10min
+                if active_secs > 0 && wall_secs > active_secs * 2 && wall_secs > 600 {
+                    Some(format_duration(wall))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        session_summaries.push(comment::format::SessionSummary {
+            session_id: session_id.clone(),
+            interactions: interactions.clone(),
+            lineage: session_lineage.clone(),
+            duration,
+            wall_time,
+        });
+
+        all_interactions.extend(interactions);
+        all_lineage.extend(session_lineage);
     }
 
-    if metrics_count == 0 {
-        println!("No process metrics found. The agent may not have captured commit-time analysis.");
-        return Ok(());
-    }
+    // 5. Diff attribution
+    println!("Computing diff attribution...");
+    let pr_diff = comment::github::get_pr_diff(pr_url).unwrap_or_default();
+    let all_attributions =
+        provenance::attribution::attribute_diff_text(&pr_diff, &all_interactions);
 
-    // Determine dominant test behavior
-    let test_behavior = if test_behaviors.iter().any(|t| t == "tdd") {
-        "tdd".to_string()
-    } else if test_behaviors.iter().any(|t| t == "test_after") {
-        "test_after".to_string()
-    } else if test_behaviors.iter().any(|t| t == "test_only") {
-        "test_only".to_string()
+    // 6. LLM summary (optional)
+    let llm_summary = if cfg.summary.enabled && !cfg.summary.command.is_empty() {
+        println!("Generating LLM summary...");
+        let bundle = provenance::summary::ProvenanceBundle {
+            interactions: all_interactions,
+            lineage: all_lineage,
+            attributions: all_attributions.clone(),
+            diff: pr_diff,
+        };
+        let summary_config = provenance::summary::SummaryConfig {
+            enabled: cfg.summary.enabled,
+            command: cfg.summary.command,
+            max_length: cfg.summary.max_length,
+        };
+        provenance::summary::generate_summary(&bundle, &summary_config)
     } else {
-        "no_tests".to_string()
+        None
     };
 
-    // 4. Format process audit comment
-    let audit_data = comment::format::ProcessAuditData {
-        session_count: session_ids.len() as i32,
-        total_interactions,
-        steering_ratio: total_steering / metrics_count as f64,
-        exploration_score: total_exploration / metrics_count as f64,
-        test_behavior,
-        error_fix_cycles: total_error_cycles,
-        red_flags: all_red_flags,
-        prompt_specificity: total_specificity / metrics_count as f64,
-        files_read: total_files_read,
-        files_written: total_files_written,
+    // 7. Format comment
+    let comment_data = comment::format::CommentData {
+        sessions: session_summaries,
+        attributions: all_attributions,
+        llm_summary,
     };
-    let comment_body = comment::format::format_process_audit(&audit_data);
+    let comment_body = comment::format::format_comment(&comment_data);
 
-    // 5. Post to GitHub
-    println!("Posting process audit comment to PR...");
+    // 8. Post to GitHub
+    println!("Posting comment to PR...");
     comment::github::post_pr_comment(pr_url, &comment_body)?;
-    println!("Done! Process audit comment posted.");
+    println!("Done! Provenance comment posted.");
 
     Ok(())
+}
+
+fn format_duration(dur: chrono::Duration) -> String {
+    let total_seconds = dur.num_seconds();
+    if total_seconds < 60 {
+        format!("{}s", total_seconds)
+    } else if total_seconds < 3600 {
+        format!("{}m", total_seconds / 60)
+    } else {
+        let hours = total_seconds / 3600;
+        let minutes = (total_seconds % 3600) / 60;
+        format!("{}h {}m", hours, minutes)
+    }
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
@@ -270,24 +358,16 @@ async fn run_daemon() -> anyhow::Result<()> {
     // 5. Watcher -> Session Manager channel
     let (tx, rx) = mpsc::channel::<watcher::WatcherEvent>(100_000);
 
-    // 6. Git Observer channel
-    let (git_cmd_tx, git_cmd_rx) = mpsc::channel::<git::observer::GitObserverCommand>(100);
-
-    // 7. Session Manager (with git observer channel)
-    let mut session_mgr_inner = session::SessionManager::new(
+    // 6. Session Manager
+    let session_mgr = Arc::new(Mutex::new(session::SessionManager::new(
         store.clone(),
         10, // idle timeout in minutes
-    );
-    session_mgr_inner.set_git_cmd_tx(git_cmd_tx);
-    let session_mgr = Arc::new(Mutex::new(session_mgr_inner));
+    )));
 
-    // 8. API state
-    let api_state = api::AppState {
-        store: store.clone(),
-        session_manager: session_mgr.clone(),
-    };
+    // 7. API state
+    let api_state = api::AppState { store: store.clone(), session_manager: session_mgr.clone() };
 
-    // 9. Spawn all tasks
+    // 8. Spawn all tasks
     let claude_dir = daemon::claude_projects_dir();
     let state_path = daemon::data_dir().join("watcher_state.json");
 
@@ -298,29 +378,15 @@ async fn run_daemon() -> anyhow::Result<()> {
     });
 
     let session_cancel = cancel.clone();
-    let session_handle = tokio::spawn(async move {
-        session_mgr.lock().await.run(rx, session_cancel).await
-    });
+    let session_handle =
+        tokio::spawn(async move { session_mgr.lock().await.run(rx, session_cancel).await });
 
     let api_cancel = cancel.clone();
-    let api_handle = tokio::spawn(async move {
-        api::serve(api_state, api_cancel).await
-    });
+    let api_handle = tokio::spawn(async move { api::serve(api_state, api_cancel).await });
 
-    let git_cancel = cancel.clone();
-    let git_store = store.clone();
-    let git_handle = tokio::spawn(async move {
-        let mut observer = git::observer::GitObserver::new(git_store, git_cmd_rx);
-        observer.run(git_cancel).await
-    });
+    tracing::info!("sannai daemon started (PID {}, db={})", std::process::id(), db_path.display(),);
 
-    tracing::info!(
-        "sannai daemon started (PID {}, db={})",
-        std::process::id(),
-        db_path.display(),
-    );
-
-    // 10. Wait for any task to complete (or cancellation)
+    // 9. Wait for any task to complete (or cancellation)
     tokio::select! {
         r = watcher_handle => {
             if let Err(e) = r? { tracing::error!("Watcher error: {}", e); }
@@ -331,12 +397,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         r = api_handle => {
             if let Err(e) = r? { tracing::error!("API server error: {}", e); }
         }
-        r = git_handle => {
-            if let Err(e) = r? { tracing::error!("Git observer error: {}", e); }
-        }
     }
 
-    // 11. Cleanup
+    // 10. Cleanup
     daemon::release_pidfile()?;
     tracing::info!("sannai daemon stopped");
 

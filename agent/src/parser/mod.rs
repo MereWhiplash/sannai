@@ -43,10 +43,7 @@ pub enum ParsedEvent {
         input: Value,
     },
     /// Emitted for queue-operation dequeue — signals a session is starting.
-    SessionStart {
-        session_id: String,
-        timestamp: DateTime<Utc>,
-    },
+    SessionStart { session_id: String, timestamp: DateTime<Utc> },
     /// Events we acknowledge but don't need to store.
     Ignored,
 }
@@ -151,10 +148,7 @@ pub fn parse_line(line: &str) -> Result<Vec<ParsedEvent>> {
 
     // First, peek at the type field to decide how to parse.
     let peek: Value = serde_json::from_str(line).context("Invalid JSON")?;
-    let event_type = peek
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let event_type = peek.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match event_type {
         "queue-operation" => parse_queue_op(line),
@@ -181,10 +175,7 @@ pub fn extract_session_id(filename: &str) -> Option<String> {
 fn parse_queue_op(line: &str) -> Result<Vec<ParsedEvent>> {
     let op: RawQueueOp = serde_json::from_str(line)?;
     if op.operation == "dequeue" {
-        Ok(vec![ParsedEvent::SessionStart {
-            session_id: op.session_id,
-            timestamp: op.timestamp,
-        }])
+        Ok(vec![ParsedEvent::SessionStart { session_id: op.session_id, timestamp: op.timestamp }])
     } else {
         Ok(vec![ParsedEvent::Ignored])
     }
@@ -211,9 +202,7 @@ fn parse_user_event(line: &str, peek: &Value) -> Result<Vec<ParsedEvent>> {
         Value::Array(blocks) => {
             let mut events = Vec::new();
             for block_val in blocks {
-                if let Ok(block) =
-                    serde_json::from_value::<RawToolResultBlock>(block_val.clone())
-                {
+                if let Ok(block) = serde_json::from_value::<RawToolResultBlock>(block_val.clone()) {
                     if block.block_type == "tool_result" {
                         let content_str = block.content.as_ref().map(|v| match v {
                             Value::String(s) => s.clone(),
@@ -242,9 +231,7 @@ fn parse_user_event(line: &str, peek: &Value) -> Result<Vec<ParsedEvent>> {
 
 fn parse_assistant_event(_line: &str, peek: &Value) -> Result<Vec<ParsedEvent>> {
     let common: RawCommon = serde_json::from_value(peek.clone())?;
-    let message_val = peek
-        .get("message")
-        .context("Assistant event missing message")?;
+    let message_val = peek.get("message").context("Assistant event missing message")?;
     let message: RawMessage = serde_json::from_value(message_val.clone())?;
 
     let uuid = common.uuid.unwrap_or_default();
@@ -335,13 +322,7 @@ mod tests {
         let events = parse_line(line).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ParsedEvent::UserPrompt {
-                session_id,
-                content,
-                cwd,
-                git_branch,
-                ..
-            } => {
+            ParsedEvent::UserPrompt { session_id, content, cwd, git_branch, .. } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(content, "Add error handling");
                 assert_eq!(cwd.as_deref(), Some("/Users/test/project"));
@@ -357,12 +338,7 @@ mod tests {
         let events = parse_line(line).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ParsedEvent::ToolResult {
-                tool_use_id,
-                is_error,
-                content,
-                ..
-            } => {
+            ParsedEvent::ToolResult { tool_use_id, is_error, content, .. } => {
                 assert_eq!(tool_use_id, "toolu_abc");
                 assert!(!is_error);
                 assert_eq!(content.as_deref(), Some("output text"));
@@ -377,13 +353,7 @@ mod tests {
         let events = parse_line(line).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ParsedEvent::AssistantText {
-                text,
-                model,
-                input_tokens,
-                output_tokens,
-                ..
-            } => {
+            ParsedEvent::AssistantText { text, model, input_tokens, output_tokens, .. } => {
                 assert_eq!(text, "Let me help you with that.");
                 assert_eq!(model.as_deref(), Some("claude-opus-4-5-20251101"));
                 assert_eq!(*input_tokens, Some(100));
@@ -399,12 +369,7 @@ mod tests {
         let events = parse_line(line).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ParsedEvent::ToolUse {
-                tool_name,
-                tool_id,
-                input,
-                ..
-            } => {
+            ParsedEvent::ToolUse { tool_name, tool_id, input, .. } => {
                 assert_eq!(tool_name, "Bash");
                 assert_eq!(tool_id, "toolu_01C7");
                 assert_eq!(input["command"], "ls -la");
@@ -469,22 +434,14 @@ mod tests {
         let events = parse_line(line).unwrap();
         assert_eq!(events.len(), 2);
         match &events[0] {
-            ParsedEvent::ToolResult {
-                tool_use_id,
-                is_error,
-                ..
-            } => {
+            ParsedEvent::ToolResult { tool_use_id, is_error, .. } => {
                 assert_eq!(tool_use_id, "t1");
                 assert!(!is_error);
             }
             other => panic!("Expected ToolResult, got {:?}", other),
         }
         match &events[1] {
-            ParsedEvent::ToolResult {
-                tool_use_id,
-                is_error,
-                ..
-            } => {
+            ParsedEvent::ToolResult { tool_use_id, is_error, .. } => {
                 assert_eq!(tool_use_id, "t2");
                 assert!(is_error);
             }
@@ -499,9 +456,7 @@ mod tests {
         let events = parse_line(line).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ParsedEvent::ToolResult {
-                content, is_error, ..
-            } => {
+            ParsedEvent::ToolResult { content, is_error, .. } => {
                 assert_eq!(content.as_deref(), Some("{\"memories\":[]}"));
                 assert!(!is_error);
             }

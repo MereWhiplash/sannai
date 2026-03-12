@@ -27,15 +27,8 @@ pub struct WatcherEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum FileClass {
-    MainSession {
-        session_id: String,
-        project_dir: String,
-    },
-    Subagent {
-        parent_session_id: String,
-        agent_id: String,
-        project_dir: String,
-    },
+    MainSession { session_id: String, project_dir: String },
+    Subagent { parent_session_id: String, agent_id: String, project_dir: String },
 }
 
 /// Tracks a file we're tailing.
@@ -82,17 +75,8 @@ pub struct FileWatcher {
 }
 
 impl FileWatcher {
-    pub fn new(
-        claude_dir: PathBuf,
-        state_path: PathBuf,
-        tx: mpsc::Sender<WatcherEvent>,
-    ) -> Self {
-        Self {
-            claude_dir,
-            state_path,
-            tailed_files: HashMap::new(),
-            tx,
-        }
+    pub fn new(claude_dir: PathBuf, state_path: PathBuf, tx: mpsc::Sender<WatcherEvent>) -> Self {
+        Self { claude_dir, state_path, tailed_files: HashMap::new(), tx }
     }
 
     /// Main run loop. Scans existing files, then watches for changes.
@@ -187,11 +171,7 @@ impl FileWatcher {
                 continue;
             }
 
-            let project_dir = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let project_dir = path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
             // Scan main session files: <project>/<uuid>.jsonl
             for file_entry in fs::read_dir(&path)? {
@@ -207,10 +187,7 @@ impl FileWatcher {
 
                         self.register_file(
                             file_path,
-                            FileClass::MainSession {
-                                session_id,
-                                project_dir: project_dir.clone(),
-                            },
+                            FileClass::MainSession { session_id, project_dir: project_dir.clone() },
                             offset,
                         );
                     }
@@ -220,10 +197,8 @@ impl FileWatcher {
                 if file_entry.path().is_dir() {
                     let subagents_dir = file_entry.path().join("subagents");
                     if subagents_dir.exists() {
-                        let parent_session_id = file_entry
-                            .file_name()
-                            .to_string_lossy()
-                            .to_string();
+                        let parent_session_id =
+                            file_entry.file_name().to_string_lossy().to_string();
 
                         for sub_entry in fs::read_dir(&subagents_dir)? {
                             let sub_entry = sub_entry?;
@@ -273,14 +248,7 @@ impl FileWatcher {
             return;
         }
         tracing::debug!("Tracking file: {} (offset={})", path.display(), offset);
-        self.tailed_files.insert(
-            path.clone(),
-            TailedFile {
-                path,
-                offset,
-                class,
-            },
-        );
+        self.tailed_files.insert(path.clone(), TailedFile { path, offset, class });
     }
 
     async fn handle_notify_event(&mut self, event: Event) {
@@ -361,9 +329,7 @@ impl FileWatcher {
                             FileClass::MainSession { project_dir, .. } => {
                                 (project_dir.clone(), false)
                             }
-                            FileClass::Subagent { project_dir, .. } => {
-                                (project_dir.clone(), true)
-                            }
+                            FileClass::Subagent { project_dir, .. } => (project_dir.clone(), true),
                         };
 
                         let event = WatcherEvent {
@@ -382,11 +348,7 @@ impl FileWatcher {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse line in {}: {}",
-                        tailed.path.display(),
-                        e
-                    );
+                    tracing::warn!("Failed to parse line in {}: {}", tailed.path.display(), e);
                 }
             }
         }
@@ -415,10 +377,7 @@ impl FileWatcher {
                 let project_dir = components[0].to_string_lossy().to_string();
                 let filename = components[1].to_string_lossy();
                 let session_id = parser::extract_session_id(&filename)?;
-                Some(FileClass::MainSession {
-                    session_id,
-                    project_dir,
-                })
+                Some(FileClass::MainSession { session_id, project_dir })
             }
             // <project-dir>/<session-id>/subagents/<agent>.jsonl
             4 => {
@@ -430,11 +389,7 @@ impl FileWatcher {
                     .and_then(|s| s.strip_suffix(".jsonl"))
                     .unwrap_or(&filename)
                     .to_string();
-                Some(FileClass::Subagent {
-                    parent_session_id,
-                    agent_id,
-                    project_dir,
-                })
+                Some(FileClass::Subagent { parent_session_id, agent_id, project_dir })
             }
             _ => None,
         }
@@ -443,9 +398,7 @@ impl FileWatcher {
     fn save_state(&self) {
         let mut state = WatcherState::default();
         for (path, tailed) in &self.tailed_files {
-            state
-                .file_offsets
-                .insert(path.to_string_lossy().to_string(), tailed.offset);
+            state.file_offsets.insert(path.to_string_lossy().to_string(), tailed.offset);
         }
         if let Err(e) = state.save(&self.state_path) {
             tracing::warn!("Failed to save watcher state: {}", e);
@@ -479,9 +432,7 @@ mod tests {
         let mut watcher = FileWatcher::new(projects_dir, state_path, tx);
 
         // Just scan, don't run the full loop
-        watcher
-            .scan_existing_files(&WatcherState::default())
-            .unwrap();
+        watcher.scan_existing_files(&WatcherState::default()).unwrap();
 
         // Drain events
         let mut events = Vec::new();
@@ -500,9 +451,7 @@ mod tests {
         let state_path = dir.path().join("state.json");
 
         let mut state = WatcherState::default();
-        state
-            .file_offsets
-            .insert("/some/file.jsonl".to_string(), 42);
+        state.file_offsets.insert("/some/file.jsonl".to_string(), 42);
         state.save(&state_path).unwrap();
 
         let loaded = WatcherState::load(&state_path);
@@ -513,21 +462,12 @@ mod tests {
     fn test_classify_main_session() {
         let claude_dir = PathBuf::from("/home/user/.claude/projects");
         let (tx, _rx) = mpsc::channel(1);
-        let watcher = FileWatcher::new(
-            claude_dir,
-            PathBuf::from("/tmp/state.json"),
-            tx,
-        );
+        let watcher = FileWatcher::new(claude_dir, PathBuf::from("/tmp/state.json"), tx);
 
-        let path = PathBuf::from(
-            "/home/user/.claude/projects/-Users-test-dev/abc-123-def.jsonl",
-        );
+        let path = PathBuf::from("/home/user/.claude/projects/-Users-test-dev/abc-123-def.jsonl");
         let class = watcher.classify_path(&path).unwrap();
         match class {
-            FileClass::MainSession {
-                session_id,
-                project_dir,
-            } => {
+            FileClass::MainSession { session_id, project_dir } => {
                 assert_eq!(session_id, "abc-123-def");
                 assert_eq!(project_dir, "-Users-test-dev");
             }
@@ -539,22 +479,14 @@ mod tests {
     fn test_classify_subagent() {
         let claude_dir = PathBuf::from("/home/user/.claude/projects");
         let (tx, _rx) = mpsc::channel(1);
-        let watcher = FileWatcher::new(
-            claude_dir,
-            PathBuf::from("/tmp/state.json"),
-            tx,
-        );
+        let watcher = FileWatcher::new(claude_dir, PathBuf::from("/tmp/state.json"), tx);
 
         let path = PathBuf::from(
             "/home/user/.claude/projects/-Users-test-dev/abc-123/subagents/agent-x7y8z9.jsonl",
         );
         let class = watcher.classify_path(&path).unwrap();
         match class {
-            FileClass::Subagent {
-                parent_session_id,
-                agent_id,
-                project_dir,
-            } => {
+            FileClass::Subagent { parent_session_id, agent_id, project_dir } => {
                 assert_eq!(parent_session_id, "abc-123");
                 assert_eq!(agent_id, "x7y8z9");
                 assert_eq!(project_dir, "-Users-test-dev");
@@ -578,10 +510,7 @@ mod tests {
         // Save state with offset past the first line
         let first_line_len = (line1.len() + 1) as u64; // +1 for newline
         let mut saved = WatcherState::default();
-        saved.file_offsets.insert(
-            session_file.to_string_lossy().to_string(),
-            first_line_len,
-        );
+        saved.file_offsets.insert(session_file.to_string_lossy().to_string(), first_line_len);
 
         let state_path = dir.path().join("state.json");
         let (tx, mut rx) = mpsc::channel(100);

@@ -35,33 +35,16 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/events", get(get_session_events))
-        .route("/sessions/:id/git-events", get(get_session_git_events))
-        .route("/sessions/:id/commits", get(get_session_commits))
-        .route(
-            "/sessions/:id/process-metrics",
-            get(get_session_process_metrics),
-        )
-        .route(
-            "/commits/:sha/process-metrics",
-            get(get_commit_process_metrics),
-        )
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
 /// Start the API server, runs until cancellation.
-/// Port can be overridden with SANNAI_API_PORT env var (default: 9847).
 pub async fn serve(state: AppState, cancel: CancellationToken) -> anyhow::Result<()> {
-    let port = std::env::var("SANNAI_API_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(9847);
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-    tracing::info!("Local API server listening on 127.0.0.1:{}", port);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(cancel.cancelled_owned())
-        .await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:9847").await?;
+    tracing::info!("Local API server listening on 127.0.0.1:9847");
+    axum::serve(listener, app).with_graceful_shutdown(cancel.cancelled_owned()).await?;
     Ok(())
 }
 
@@ -82,6 +65,8 @@ async fn health() -> Json<serde_json::Value> {
 struct CommitHookRequest {
     sha: String,
     repo: String,
+    /// If provided, link directly to this session instead of searching active sessions.
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -93,26 +78,41 @@ async fn hook_commit(
     State(state): State<AppState>,
     Json(req): Json<CommitHookRequest>,
 ) -> Result<Json<CommitHookResponse>, StatusCode> {
-    let session_ids = state
-        .session_manager
-        .lock()
-        .await
-        .active_sessions_for_repo(&req.repo);
+    // If session_id is provided (e.g. from Claude Code hook), link directly.
+    // Otherwise fall back to searching active sessions by repo path.
+    let session_ids = if let Some(ref sid) = req.session_id {
+        vec![sid.clone()]
+    } else {
+        state.session_manager.lock().await.active_sessions_for_repo(&req.repo)
+    };
 
     let store = state.store.lock().await;
     let mut linked = Vec::new();
 
     for session_id in &session_ids {
+        // Ensure the session exists in the store before linking
+        if req.session_id.is_some() {
+            if let Ok(None) = store.get_session(session_id) {
+                // Session not yet tracked by sannai — create a stub so the link succeeds
+                let session = store::Session {
+                    id: session_id.clone(),
+                    tool: "claude_code".to_string(),
+                    project_path: Some(req.repo.clone()),
+                    git_branch: None,
+                    started_at: chrono::Utc::now(),
+                    ended_at: None,
+                    synced_at: None,
+                    metadata: None,
+                };
+                let _ = store.upsert_session(&session);
+            }
+        }
+
         let link = store::CommitLink {
             commit_sha: req.sha.clone(),
             session_id: session_id.clone(),
             repo_path: req.repo.clone(),
             linked_at: chrono::Utc::now(),
-            parent_shas: None,
-            message: None,
-            files_changed: None,
-            diff_stat: None,
-            detection_method: Some("hook".to_string()),
         };
         if let Err(e) = store.link_commit(&link) {
             tracing::warn!("Failed to link commit {} to session {}: {}", req.sha, session_id, e);
@@ -128,9 +128,7 @@ async fn hook_commit(
         req.repo,
     );
 
-    Ok(Json(CommitHookResponse {
-        linked_sessions: linked,
-    }))
+    Ok(Json(CommitHookResponse { linked_sessions: linked }))
 }
 
 // --- GET /sessions ---
@@ -168,9 +166,7 @@ async fn list_sessions(
 
     let mut response = Vec::new();
     for s in sessions {
-        let count = store
-            .count_events_for_session(&s.id)
-            .unwrap_or(0);
+        let count = store.count_events_for_session(&s.id).unwrap_or(0);
         response.push(SessionResponse {
             id: s.id,
             tool: s.tool,
@@ -196,9 +192,7 @@ async fn get_session(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let count = store
-        .count_events_for_session(&session.id)
-        .unwrap_or(0);
+    let count = store.count_events_for_session(&session.id).unwrap_or(0);
 
     Ok(Json(SessionResponse {
         id: session.id,
@@ -224,84 +218,8 @@ async fn get_session_events(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let events = store
-        .get_events_for_session(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let events =
+        store.get_events_for_session(&id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(events))
-}
-
-// --- GET /sessions/:id/git-events ---
-
-async fn get_session_git_events(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<store::GitEvent>>, StatusCode> {
-    let store = state.store.lock().await;
-
-    store
-        .get_session(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let events = store
-        .get_git_events_for_session(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(events))
-}
-
-// --- GET /sessions/:id/commits ---
-
-async fn get_session_commits(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<store::CommitLink>>, StatusCode> {
-    let store = state.store.lock().await;
-
-    store
-        .get_session(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let links = store
-        .get_commit_links_for_session(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(links))
-}
-
-// --- GET /sessions/:id/process-metrics ---
-
-async fn get_session_process_metrics(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<store::ProcessMetrics>>, StatusCode> {
-    let store = state.store.lock().await;
-
-    store
-        .get_session(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let metrics = store
-        .get_process_metrics_for_session(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(metrics))
-}
-
-// --- GET /commits/:sha/process-metrics ---
-
-async fn get_commit_process_metrics(
-    State(state): State<AppState>,
-    Path(sha): Path<String>,
-) -> Result<Json<Vec<store::ProcessMetrics>>, StatusCode> {
-    let store = state.store.lock().await;
-
-    let metrics = store
-        .get_process_metrics_for_commit(&sha)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(metrics))
 }

@@ -73,11 +73,27 @@ pub fn attribute_diff(
         .collect()
 }
 
+/// Patterns for generated/lock files that should be excluded from attribution.
+const GENERATED_PATTERNS: &[&str] = &[
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "yarn.lock",
+    "Cargo.lock",
+    "go.sum",
+    "Gemfile.lock",
+    "poetry.lock",
+    "composer.lock",
+    ".min.js",
+    ".min.css",
+];
+
+/// Returns true if the file path matches a generated/lock file pattern.
+fn is_generated_file(path: &str) -> bool {
+    GENERATED_PATTERNS.iter().any(|pat| path.ends_with(pat))
+}
+
 /// Attribute hunks from a pre-computed diff string (e.g., the full PR diff).
-pub fn attribute_diff_text(
-    diff_text: &str,
-    interactions: &[Interaction],
-) -> Vec<DiffAttribution> {
+pub fn attribute_diff_text(diff_text: &str, interactions: &[Interaction]) -> Vec<DiffAttribution> {
     let hunks = match parse_unified_diff(diff_text) {
         Ok(h) => h,
         Err(e) => {
@@ -88,6 +104,7 @@ pub fn attribute_diff_text(
 
     hunks
         .iter()
+        .filter(|hunk| !is_generated_file(&hunk.file_path))
         .map(|hunk| {
             let (interaction_id, confidence, attribution_type) =
                 match_hunk_to_interaction(hunk, interactions);
@@ -106,32 +123,19 @@ pub fn attribute_diff_text(
 
 fn parse_commit_diff(repo_path: &str, commit_sha: &str) -> anyhow::Result<Vec<DiffHunk>> {
     let output = Command::new("git")
-        .args([
-            "diff",
-            &format!("{}~1", commit_sha),
-            commit_sha,
-            "--unified=0",
-        ])
+        .args(["diff", &format!("{}~1", commit_sha), commit_sha, "--unified=0"])
         .current_dir(repo_path)
         .output()?;
 
     if !output.status.success() {
         // Might be the first commit — try diff against empty tree
         let output = Command::new("git")
-            .args([
-                "diff",
-                "4b825dc642cb6eb9a060e54bf899d69f82534100",
-                commit_sha,
-                "--unified=0",
-            ])
+            .args(["diff", "4b825dc642cb6eb9a060e54bf899d69f82534100", commit_sha, "--unified=0"])
             .current_dir(repo_path)
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!(
-                "git diff failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            anyhow::bail!("git diff failed: {}", String::from_utf8_lossy(&output.stderr));
         }
         return parse_unified_diff(&String::from_utf8_lossy(&output.stdout));
     }
@@ -216,7 +220,8 @@ fn match_hunk_to_interaction(
     }
 
     let added_text = hunk.added_lines.join("\n");
-    let mut best_match: Option<(String, f32)> = None;
+    let mut best_content_match: Option<(String, f32)> = None;
+    let mut file_level_match: Option<String> = None;
 
     for interaction in interactions {
         for tc in &interaction.tool_calls {
@@ -241,28 +246,57 @@ fn match_hunk_to_interaction(
                 continue;
             }
 
+            // File-level match: an AI interaction wrote to this file
+            if file_level_match.is_none() {
+                file_level_match = Some(interaction.id.clone());
+            }
+
             let written = get_written_content(tc);
             if written.is_empty() {
                 continue;
             }
 
             let similarity = compute_similarity(&added_text, &written);
-            if let Some((_, best_sim)) = &best_match {
+            if let Some((_, best_sim)) = &best_content_match {
                 if similarity > *best_sim {
-                    best_match = Some((interaction.id.clone(), similarity));
+                    best_content_match = Some((interaction.id.clone(), similarity));
                 }
             } else if similarity > 0.1 {
-                best_match = Some((interaction.id.clone(), similarity));
+                best_content_match = Some((interaction.id.clone(), similarity));
             }
         }
     }
 
-    match best_match {
-        Some((id, conf)) if conf >= 0.7 => (Some(id), conf, AttributionType::AiGenerated),
-        Some((id, conf)) if conf >= 0.3 => (Some(id), conf, AttributionType::AiAssisted),
-        Some((id, conf)) => (Some(id), conf, AttributionType::Manual),
-        None => (None, 0.0, AttributionType::Manual),
+    // First: content-level matching (high confidence)
+    match best_content_match {
+        Some((id, conf)) if conf >= 0.7 => return (Some(id), conf, AttributionType::AiGenerated),
+        Some((id, conf)) if conf >= 0.3 => return (Some(id), conf, AttributionType::AiAssisted),
+        _ => {}
     }
+
+    // Fallback: file-level matching — an AI interaction wrote/edited this file,
+    // even if we can't match the exact content (truncated inputs, multiple edits, etc.)
+    if let Some(id) = file_level_match {
+        return (Some(id), 0.5, AttributionType::AiAssisted);
+    }
+
+    // No match at all — but if ANY interaction exists, the code was produced during
+    // an AI session. Check if the file was at least read by an interaction.
+    for interaction in interactions {
+        for tc in &interaction.tool_calls {
+            let tc_path = tc
+                .input
+                .get("file_path")
+                .or_else(|| tc.input.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if paths_match(tc_path, &hunk.file_path) {
+                return (Some(interaction.id.clone()), 0.3, AttributionType::AiAssisted);
+            }
+        }
+    }
+
+    (None, 0.0, AttributionType::Unknown)
 }
 
 fn paths_match(tc_path: &str, diff_path: &str) -> bool {
@@ -277,12 +311,9 @@ fn paths_match(tc_path: &str, diff_path: &str) -> bool {
 fn get_written_content(tc: &super::interaction::ToolCall) -> String {
     let name = tc.tool_name.to_lowercase();
     match name.as_str() {
-        "write" | "write_file" => tc
-            .input
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        "write" | "write_file" => {
+            tc.input.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
         "edit" | "str_replace" | "str_replace_editor" => tc
             .input
             .get("new_string")
@@ -296,20 +327,14 @@ fn get_written_content(tc: &super::interaction::ToolCall) -> String {
 
 /// Simple line-based similarity: fraction of diff lines found in written content.
 fn compute_similarity(diff_text: &str, written_text: &str) -> f32 {
-    let diff_lines: Vec<&str> = diff_text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let diff_lines: Vec<&str> =
+        diff_text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
 
     if diff_lines.is_empty() {
         return 0.0;
     }
 
-    let matched = diff_lines
-        .iter()
-        .filter(|line| written_text.contains(*line))
-        .count();
+    let matched = diff_lines.iter().filter(|line| written_text.contains(*line)).count();
 
     matched as f32 / diff_lines.len() as f32
 }
@@ -322,10 +347,7 @@ mod tests {
     fn test_parse_hunk_header() {
         assert_eq!(parse_hunk_header("@@ -0,0 +1,25 @@"), Some((1, 25)));
         assert_eq!(parse_hunk_header("@@ -10,5 +12 @@"), Some((12, 1)));
-        assert_eq!(
-            parse_hunk_header("@@ -1,3 +1,4 @@ fn main()"),
-            Some((1, 4))
-        );
+        assert_eq!(parse_hunk_header("@@ -1,3 +1,4 @@ fn main()"), Some((1, 4)));
     }
 
     #[test]

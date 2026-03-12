@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 
 /// Get commit SHAs for a PR using the `gh` CLI.
 pub fn get_pr_commits(pr_url: &str) -> Result<Vec<String>> {
@@ -27,13 +28,73 @@ pub fn get_pr_commits(pr_url: &str) -> Result<Vec<String>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let shas: Vec<String> = stdout
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let shas: Vec<String> =
+        stdout.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
     Ok(shas)
+}
+
+/// Get individual commit timestamps for a PR.
+pub fn get_pr_commit_times(pr_url: &str) -> Result<Vec<DateTime<Utc>>> {
+    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
+
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number,
+            "--repo",
+            &owner_repo,
+            "--json",
+            "commits",
+            "--jq",
+            ".commits[].committedDate",
+        ])
+        .output()
+        .context("Failed to run `gh` CLI")?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dates: Vec<DateTime<Utc>> = stdout
+        .lines()
+        .filter_map(|s| s.trim().parse::<DateTime<Utc>>().ok())
+        .collect();
+
+    Ok(dates)
+}
+
+/// Get the head branch name for a PR.
+pub fn get_pr_head_branch(pr_url: &str) -> Result<Option<String>> {
+    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
+
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number,
+            "--repo",
+            &owner_repo,
+            "--json",
+            "headRefName",
+            "--jq",
+            ".headRefName",
+        ])
+        .output()
+        .context("Failed to run `gh` CLI")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(branch))
+    }
 }
 
 /// Get the diff for a PR.
@@ -81,15 +142,7 @@ pub fn post_pr_comment(pr_url: &str, body: &str) -> Result<()> {
         tracing::info!("Updated existing Sannai comment on PR #{}", pr_number);
     } else {
         let output = Command::new("gh")
-            .args([
-                "pr",
-                "comment",
-                &pr_number,
-                "--repo",
-                &owner_repo,
-                "--body",
-                body,
-            ])
+            .args(["pr", "comment", &pr_number, "--repo", &owner_repo, "--body", body])
             .output()
             .context("Failed to post PR comment")?;
 
@@ -110,17 +163,13 @@ fn find_existing_comment(owner_repo: &str, pr_number: &str) -> Result<Option<Str
             "api",
             &format!("repos/{}/issues/{}/comments", owner_repo, pr_number),
             "--jq",
-            r#".[] | select(.body | contains("AI Process Audit")) | .id"#,
+            r#".[] | select(.body | contains("Sannai Code Provenance")) | .id"#,
         ])
         .output()?;
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let id = stdout
-            .lines()
-            .next()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let id = stdout.lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         Ok(id)
     } else {
         Ok(None)
@@ -159,16 +208,15 @@ mod tests {
 
     #[test]
     fn test_parse_pr_url_full() {
-        let (repo, number) =
-            parse_pr_url("https://github.com/AaronFR/sannai/pull/42").unwrap();
-        assert_eq!(repo, "AaronFR/sannai");
+        let (repo, number) = parse_pr_url("https://github.com/MereWhiplash/sannai/pull/42").unwrap();
+        assert_eq!(repo, "MereWhiplash/sannai");
         assert_eq!(number, "42");
     }
 
     #[test]
     fn test_parse_pr_url_short() {
-        let (repo, number) = parse_pr_url("AaronFR/sannai#42").unwrap();
-        assert_eq!(repo, "AaronFR/sannai");
+        let (repo, number) = parse_pr_url("MereWhiplash/sannai#42").unwrap();
+        assert_eq!(repo, "MereWhiplash/sannai");
         assert_eq!(number, "42");
     }
 
