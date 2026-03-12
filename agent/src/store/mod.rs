@@ -44,6 +44,7 @@ pub struct Session {
     pub id: String,
     pub tool: String,
     pub project_path: Option<String>,
+    pub git_branch: Option<String>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub synced_at: Option<DateTime<Utc>>,
@@ -89,6 +90,9 @@ impl Store {
 
         conn.execute_batch(MIGRATION).context("Failed to run migrations")?;
 
+        // Migration v2: add git_branch column
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN git_branch TEXT", []);
+
         Ok(Self { conn })
     }
 
@@ -96,10 +100,11 @@ impl Store {
 
     pub fn upsert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sessions (id, tool, project_path, started_at, ended_at, synced_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO sessions (id, tool, project_path, git_branch, started_at, ended_at, synced_at, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 project_path = COALESCE(excluded.project_path, sessions.project_path),
+                git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
                 ended_at = COALESCE(excluded.ended_at, sessions.ended_at),
                 synced_at = COALESCE(excluded.synced_at, sessions.synced_at),
                 metadata = COALESCE(excluded.metadata, sessions.metadata)",
@@ -107,6 +112,7 @@ impl Store {
                 session.id,
                 session.tool,
                 session.project_path,
+                session.git_branch,
                 session.started_at.to_rfc3339(),
                 session.ended_at.map(|t| t.to_rfc3339()),
                 session.synced_at.map(|t| t.to_rfc3339()),
@@ -119,7 +125,7 @@ impl Store {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, tool, project_path, started_at, ended_at, synced_at, metadata
+                "SELECT id, tool, project_path, git_branch, started_at, ended_at, synced_at, metadata
                  FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -127,11 +133,12 @@ impl Store {
                         id: row.get(0)?,
                         tool: row.get(1)?,
                         project_path: row.get(2)?,
-                        started_at: parse_datetime(row.get::<_, String>(3)?),
-                        ended_at: row.get::<_, Option<String>>(4)?.map(parse_datetime),
-                        synced_at: row.get::<_, Option<String>>(5)?.map(parse_datetime),
+                        git_branch: row.get(3)?,
+                        started_at: parse_datetime(row.get::<_, String>(4)?),
+                        ended_at: row.get::<_, Option<String>>(5)?.map(parse_datetime),
+                        synced_at: row.get::<_, Option<String>>(6)?.map(parse_datetime),
                         metadata: row
-                            .get::<_, Option<String>>(6)?
+                            .get::<_, Option<String>>(7)?
                             .and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 },
@@ -142,7 +149,7 @@ impl Store {
 
     pub fn list_sessions(&self, limit: u32, offset: u32) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, tool, project_path, started_at, ended_at, synced_at, metadata
+            "SELECT id, tool, project_path, git_branch, started_at, ended_at, synced_at, metadata
              FROM sessions ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
         )?;
 
@@ -151,11 +158,12 @@ impl Store {
                 id: row.get(0)?,
                 tool: row.get(1)?,
                 project_path: row.get(2)?,
-                started_at: parse_datetime(row.get::<_, String>(3)?),
-                ended_at: row.get::<_, Option<String>>(4)?.map(parse_datetime),
-                synced_at: row.get::<_, Option<String>>(5)?.map(parse_datetime),
+                git_branch: row.get(3)?,
+                started_at: parse_datetime(row.get::<_, String>(4)?),
+                ended_at: row.get::<_, Option<String>>(5)?.map(parse_datetime),
+                synced_at: row.get::<_, Option<String>>(6)?.map(parse_datetime),
                 metadata: row
-                    .get::<_, Option<String>>(6)?
+                    .get::<_, Option<String>>(7)?
                     .and_then(|s| serde_json::from_str(&s).ok()),
             })
         })?;
@@ -222,6 +230,22 @@ impl Store {
         Ok(events)
     }
 
+    /// Get the timestamp of the last event in a session.
+    /// Useful for estimating the effective end time of unclosed sessions.
+    pub fn get_last_event_time(&self, session_id: &str) -> Result<Option<DateTime<Utc>>> {
+        self.conn
+            .query_row(
+                "SELECT MAX(timestamp) FROM events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .context("Failed to query last event time")?
+            .flatten()
+            .map(|s| Ok(parse_datetime(s)))
+            .transpose()
+    }
+
     pub fn count_events_for_session(&self, session_id: &str) -> Result<u64> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM events WHERE session_id = ?1",
@@ -244,7 +268,7 @@ impl Store {
 
     pub fn get_sessions_for_commit(&self, sha: &str) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.tool, s.project_path, s.started_at, s.ended_at, s.synced_at, s.metadata
+            "SELECT s.id, s.tool, s.project_path, s.git_branch, s.started_at, s.ended_at, s.synced_at, s.metadata
              FROM sessions s
              INNER JOIN commit_links cl ON s.id = cl.session_id
              WHERE cl.commit_sha = ?1",
@@ -255,11 +279,12 @@ impl Store {
                 id: row.get(0)?,
                 tool: row.get(1)?,
                 project_path: row.get(2)?,
-                started_at: parse_datetime(row.get::<_, String>(3)?),
-                ended_at: row.get::<_, Option<String>>(4)?.map(parse_datetime),
-                synced_at: row.get::<_, Option<String>>(5)?.map(parse_datetime),
+                git_branch: row.get(3)?,
+                started_at: parse_datetime(row.get::<_, String>(4)?),
+                ended_at: row.get::<_, Option<String>>(5)?.map(parse_datetime),
+                synced_at: row.get::<_, Option<String>>(6)?.map(parse_datetime),
                 metadata: row
-                    .get::<_, Option<String>>(6)?
+                    .get::<_, Option<String>>(7)?
                     .and_then(|s| serde_json::from_str(&s).ok()),
             })
         })?;
@@ -273,7 +298,7 @@ impl Store {
 
     pub fn get_active_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, tool, project_path, started_at, ended_at, synced_at, metadata
+            "SELECT id, tool, project_path, git_branch, started_at, ended_at, synced_at, metadata
              FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC",
         )?;
 
@@ -282,11 +307,12 @@ impl Store {
                 id: row.get(0)?,
                 tool: row.get(1)?,
                 project_path: row.get(2)?,
-                started_at: parse_datetime(row.get::<_, String>(3)?),
-                ended_at: row.get::<_, Option<String>>(4)?.map(parse_datetime),
-                synced_at: row.get::<_, Option<String>>(5)?.map(parse_datetime),
+                git_branch: row.get(3)?,
+                started_at: parse_datetime(row.get::<_, String>(4)?),
+                ended_at: row.get::<_, Option<String>>(5)?.map(parse_datetime),
+                synced_at: row.get::<_, Option<String>>(6)?.map(parse_datetime),
                 metadata: row
-                    .get::<_, Option<String>>(6)?
+                    .get::<_, Option<String>>(7)?
                     .and_then(|s| serde_json::from_str(&s).ok()),
             })
         })?;
@@ -332,6 +358,7 @@ mod tests {
             id: "test-session-1".to_string(),
             tool: "claude_code".to_string(),
             project_path: Some("/Users/test/project".to_string()),
+            git_branch: None,
             started_at: now,
             ended_at: None,
             synced_at: None,
@@ -356,6 +383,7 @@ mod tests {
             id: "test-session-2".to_string(),
             tool: "claude_code".to_string(),
             project_path: None,
+            git_branch: None,
             started_at: now,
             ended_at: None,
             synced_at: None,
@@ -380,6 +408,7 @@ mod tests {
             id: "test-session-3".to_string(),
             tool: "claude_code".to_string(),
             project_path: None,
+            git_branch: None,
             started_at: now,
             ended_at: None,
             synced_at: None,
@@ -403,6 +432,7 @@ mod tests {
                 id: format!("session-{}", i),
                 tool: "claude_code".to_string(),
                 project_path: None,
+                git_branch: None,
                 started_at: now + chrono::Duration::minutes(i as i64),
                 ended_at: None,
                 synced_at: None,
@@ -433,6 +463,7 @@ mod tests {
             id: "event-test-session".to_string(),
             tool: "claude_code".to_string(),
             project_path: None,
+            git_branch: None,
             started_at: now,
             ended_at: None,
             synced_at: None,
@@ -481,6 +512,7 @@ mod tests {
             id: "commit-test-session".to_string(),
             tool: "claude_code".to_string(),
             project_path: Some("/Users/test/repo".to_string()),
+            git_branch: None,
             started_at: now,
             ended_at: None,
             synced_at: None,
@@ -515,6 +547,7 @@ mod tests {
                 id: "active-1".to_string(),
                 tool: "claude_code".to_string(),
                 project_path: None,
+                git_branch: None,
                 started_at: now,
                 ended_at: None,
                 synced_at: None,
@@ -528,6 +561,7 @@ mod tests {
                 id: "ended-1".to_string(),
                 tool: "claude_code".to_string(),
                 project_path: None,
+                git_branch: None,
                 started_at: now,
                 ended_at: Some(now),
                 synced_at: None,
@@ -557,6 +591,7 @@ mod tests {
             id: "meta-test".to_string(),
             tool: "claude_code".to_string(),
             project_path: None,
+            git_branch: None,
             started_at: now,
             ended_at: None,
             synced_at: None,

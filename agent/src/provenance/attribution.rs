@@ -264,8 +264,7 @@ fn match_hunk_to_interaction(
     match best_match {
         Some((id, conf)) if conf >= 0.7 => (Some(id), conf, AttributionType::AiGenerated),
         Some((id, conf)) if conf >= 0.3 => (Some(id), conf, AttributionType::AiAssisted),
-        Some((id, conf)) => (Some(id), conf, AttributionType::AiAssisted),
-        None => (None, 0.0, AttributionType::Unknown),
+        _ => (None, 0.0, AttributionType::Unknown),
     }
 }
 

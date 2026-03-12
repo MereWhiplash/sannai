@@ -65,6 +65,8 @@ async fn health() -> Json<serde_json::Value> {
 struct CommitHookRequest {
     sha: String,
     repo: String,
+    /// If provided, link directly to this session instead of searching active sessions.
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -76,12 +78,36 @@ async fn hook_commit(
     State(state): State<AppState>,
     Json(req): Json<CommitHookRequest>,
 ) -> Result<Json<CommitHookResponse>, StatusCode> {
-    let session_ids = state.session_manager.lock().await.active_sessions_for_repo(&req.repo);
+    // If session_id is provided (e.g. from Claude Code hook), link directly.
+    // Otherwise fall back to searching active sessions by repo path.
+    let session_ids = if let Some(ref sid) = req.session_id {
+        vec![sid.clone()]
+    } else {
+        state.session_manager.lock().await.active_sessions_for_repo(&req.repo)
+    };
 
     let store = state.store.lock().await;
     let mut linked = Vec::new();
 
     for session_id in &session_ids {
+        // Ensure the session exists in the store before linking
+        if req.session_id.is_some() {
+            if let Ok(None) = store.get_session(session_id) {
+                // Session not yet tracked by sannai — create a stub so the link succeeds
+                let session = store::Session {
+                    id: session_id.clone(),
+                    tool: "claude_code".to_string(),
+                    project_path: Some(req.repo.clone()),
+                    git_branch: None,
+                    started_at: chrono::Utc::now(),
+                    ended_at: None,
+                    synced_at: None,
+                    metadata: None,
+                };
+                let _ = store.upsert_session(&session);
+            }
+        }
+
         let link = store::CommitLink {
             commit_sha: req.sha.clone(),
             session_id: session_id.clone(),

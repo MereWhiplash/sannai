@@ -18,6 +18,7 @@ struct ActiveSession {
     id: String,
     project_path: Option<String>,
     cwd: Option<String>,
+    git_branch: Option<String>,
     started_at: DateTime<Utc>,
     last_event_at: DateTime<Utc>,
     prompt_count: u64,
@@ -213,29 +214,43 @@ impl SessionManager {
         timestamp: DateTime<Utc>,
         project_dir: &str,
         cwd: Option<&str>,
-        _git_branch: Option<&str>,
+        git_branch: Option<&str>,
     ) -> Result<()> {
         if self.active_sessions.contains_key(session_id) {
-            // Update cwd if we got a new one
-            if let Some(cwd) = cwd {
-                if let Some(active) = self.active_sessions.get_mut(session_id) {
+            let needs_store_update;
+            if let Some(active) = self.active_sessions.get_mut(session_id) {
+                let mut changed = false;
+                if let Some(cwd) = cwd {
                     if active.cwd.is_none() {
                         active.cwd = Some(cwd.to_string());
                         active.project_path = Some(cwd.to_string());
-                        // Update store too
-                        let session = store::Session {
-                            id: session_id.to_string(),
-                            tool: "claude_code".to_string(),
-                            project_path: Some(cwd.to_string()),
-                            started_at: active.started_at,
-                            ended_at: None,
-                            synced_at: None,
-                            metadata: None,
-                        };
-                        self.store.lock().await.upsert_session(&session)?;
+                        changed = true;
                     }
                 }
+                if let Some(branch) = git_branch {
+                    if active.git_branch.is_none() {
+                        active.git_branch = Some(branch.to_string());
+                        changed = true;
+                    }
+                }
+                needs_store_update = changed;
+                if changed {
+                    let session = store::Session {
+                        id: session_id.to_string(),
+                        tool: "claude_code".to_string(),
+                        project_path: active.project_path.clone(),
+                        git_branch: active.git_branch.clone(),
+                        started_at: active.started_at,
+                        ended_at: None,
+                        synced_at: None,
+                        metadata: None,
+                    };
+                    self.store.lock().await.upsert_session(&session)?;
+                }
+            } else {
+                needs_store_update = false;
             }
+            let _ = needs_store_update;
             return Ok(());
         }
 
@@ -247,6 +262,7 @@ impl SessionManager {
             id: session_id.to_string(),
             tool: "claude_code".to_string(),
             project_path: Some(project_path.clone()),
+            git_branch: git_branch.map(|s| s.to_string()),
             started_at: timestamp,
             ended_at: None,
             synced_at: None,
@@ -263,6 +279,7 @@ impl SessionManager {
                 id: session_id.to_string(),
                 project_path: Some(project_path),
                 cwd: cwd.map(|s| s.to_string()),
+                git_branch: git_branch.map(|s| s.to_string()),
                 started_at: timestamp,
                 last_event_at: timestamp,
                 prompt_count: 0,

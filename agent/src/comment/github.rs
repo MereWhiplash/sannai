@@ -34,9 +34,8 @@ pub fn get_pr_commits(pr_url: &str) -> Result<Vec<String>> {
     Ok(shas)
 }
 
-/// Get the time range of commits in a PR (earliest, latest).
-/// Returns None if timestamps can't be parsed.
-pub fn get_pr_commit_time_range(pr_url: &str) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+/// Get individual commit timestamps for a PR.
+pub fn get_pr_commit_times(pr_url: &str) -> Result<Vec<DateTime<Utc>>> {
     let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
 
     let output = Command::new("gh")
@@ -55,21 +54,47 @@ pub fn get_pr_commit_time_range(pr_url: &str) -> Result<Option<(DateTime<Utc>, D
         .context("Failed to run `gh` CLI")?;
 
     if !output.status.success() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut dates: Vec<DateTime<Utc>> = stdout
+    let dates: Vec<DateTime<Utc>> = stdout
         .lines()
         .filter_map(|s| s.trim().parse::<DateTime<Utc>>().ok())
         .collect();
 
-    if dates.is_empty() {
+    Ok(dates)
+}
+
+/// Get the head branch name for a PR.
+pub fn get_pr_head_branch(pr_url: &str) -> Result<Option<String>> {
+    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
+
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number,
+            "--repo",
+            &owner_repo,
+            "--json",
+            "headRefName",
+            "--jq",
+            ".headRefName",
+        ])
+        .output()
+        .context("Failed to run `gh` CLI")?;
+
+    if !output.status.success() {
         return Ok(None);
     }
 
-    dates.sort();
-    Ok(Some((dates[0], dates[dates.len() - 1])))
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(branch))
+    }
 }
 
 /// Get the diff for a PR.
@@ -183,15 +208,15 @@ mod tests {
 
     #[test]
     fn test_parse_pr_url_full() {
-        let (repo, number) = parse_pr_url("https://github.com/AaronFR/sannai/pull/42").unwrap();
-        assert_eq!(repo, "AaronFR/sannai");
+        let (repo, number) = parse_pr_url("https://github.com/MereWhiplash/sannai/pull/42").unwrap();
+        assert_eq!(repo, "MereWhiplash/sannai");
         assert_eq!(number, "42");
     }
 
     #[test]
     fn test_parse_pr_url_short() {
-        let (repo, number) = parse_pr_url("AaronFR/sannai#42").unwrap();
-        assert_eq!(repo, "AaronFR/sannai");
+        let (repo, number) = parse_pr_url("MereWhiplash/sannai#42").unwrap();
+        assert_eq!(repo, "MereWhiplash/sannai");
         assert_eq!(number, "42");
     }
 
