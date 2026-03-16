@@ -6,7 +6,7 @@ Local daemon that captures Claude Code sessions and posts provenance comments on
 
 ```bash
 cargo build
-cargo test                        # All 79 tests
+cargo test                        # All 97 tests
 cargo test test_parse_user        # Single test by name
 cargo clippy -- -D warnings       # Lint (CI treats warnings as errors)
 cargo fmt                         # Format (max_width=100, see rustfmt.toml)
@@ -16,6 +16,9 @@ cargo run -- sessions             # List captured sessions
 cargo run -- comment --pr <url>   # Post provenance comment on a PR
 cargo run -- install              # Register as system service
 cargo run -- uninstall [--purge]  # Remove service (and optionally data)
+cargo run -- hook install         # Install git + Claude Code hooks in cwd
+cargo run -- hook status          # Check which hooks are installed
+cargo run -- hook uninstall       # Remove sannai hooks from cwd
 ```
 
 ## Architecture
@@ -53,6 +56,7 @@ watcher -> parser -> session -> store
 - **comment/github** — `gh` CLI wrapper for fetching PR data and posting/updating comments.
 - **config** — Loads `~/.config/sannai/config.toml` for summary settings.
 - **service** — Cross-platform daemon installer (launchd on macOS, systemd on Linux).
+- **hook** — Manages git pre-push hooks (auto PR comments) and Claude Code PostToolUse hooks (commit linking). Embeds hook scripts via `include_str!`, injects binary path at install time. Merges into existing `.claude/settings.json` without clobbering.
 
 ## API Endpoints (local, :9847)
 

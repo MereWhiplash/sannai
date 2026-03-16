@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use sannai::{api, comment, config, daemon, provenance, service, session, store, watcher};
+use sannai::{api, comment, config, daemon, hook, provenance, service, session, store, watcher};
 
 #[derive(Parser)]
 #[command(name = "sannai")]
@@ -47,6 +47,36 @@ enum Commands {
         #[arg(long)]
         pr: String,
 
+        /// Path to the git repository (defaults to current directory)
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Manage git and Claude Code hooks for a repository
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    /// Install sannai hooks (pre-push + Claude Code commit linker)
+    Install {
+        /// Path to the git repository (defaults to current directory)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Overwrite existing non-sannai hooks
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show which sannai hooks are installed
+    Status {
+        /// Path to the git repository (defaults to current directory)
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Remove sannai hooks from a repository
+    Uninstall {
         /// Path to the git repository (defaults to current directory)
         #[arg(long)]
         repo: Option<String>,
@@ -125,9 +155,39 @@ async fn main() -> anyhow::Result<()> {
         Commands::Comment { pr, repo } => {
             run_comment(&pr, repo.as_deref())?;
         }
+        Commands::Hook { action } => {
+            let repo_path = match &action {
+                HookAction::Install { repo, .. }
+                | HookAction::Status { repo }
+                | HookAction::Uninstall { repo } => resolve_repo_path(repo.as_deref())?,
+            };
+            match action {
+                HookAction::Install { force, .. } => {
+                    hook::install_hooks(&repo_path, force)?;
+                }
+                HookAction::Status { .. } => {
+                    hook::print_hook_status(&repo_path)?;
+                }
+                HookAction::Uninstall { .. } => {
+                    hook::uninstall_hooks(&repo_path)?;
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+fn resolve_repo_path(repo: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    let path = match repo {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::env::current_dir()?,
+    };
+    let canonical = path.canonicalize()?;
+    if !canonical.join(".git").exists() {
+        anyhow::bail!("Not a git repository: {}", canonical.display());
+    }
+    Ok(canonical)
 }
 
 fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
