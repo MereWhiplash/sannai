@@ -36,9 +36,12 @@ if [ -z "$SHA" ] || [ -z "$REPO" ]; then
 fi
 
 # Link the commit to the session via sannai API
+PAYLOAD=$(jq -n --arg sha "$SHA" --arg repo "$REPO" --arg sid "$SESSION_ID" \
+  '{sha: $sha, repo: $repo, session_id: $sid}')
+
 curl -s -X POST http://127.0.0.1:9847/hook/commit \
   -H "Content-Type: application/json" \
-  -d "{\"sha\": \"$SHA\", \"repo\": \"$REPO\", \"session_id\": \"$SESSION_ID\"}" \
+  -d "$PAYLOAD" \
   > /dev/null 2>&1
 
 exit 0

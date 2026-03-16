@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 const HOOK_MARKER: &str = "# SANNAI-MANAGED-HOOK";
@@ -84,7 +84,7 @@ fn has_sannai_hook_entry(json_str: &str) -> bool {
                         hooks.iter().any(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
-                                .map(|c| c.contains("link-commit") || c.contains("sannai"))
+                                .map(is_sannai_command)
                                 .unwrap_or(false)
                         })
                     })
@@ -97,10 +97,6 @@ fn has_sannai_hook_entry(json_str: &str) -> bool {
 // --- Install ---
 
 pub fn install_hooks(repo_root: &Path, force: bool) -> Result<()> {
-    if !repo_root.join(".git").exists() {
-        bail!("Not a git repository: {}", repo_root.display());
-    }
-
     let bin_path = std::env::current_exe()?.to_string_lossy().to_string();
     let paths = HookPaths::new(repo_root);
 
@@ -180,7 +176,9 @@ fn install_pre_push(paths: &HookPaths, sannai_bin: &str, force: bool) -> Result<
 }
 
 fn generate_pre_push_script(sannai_bin: &str) -> String {
-    let script: String = POST_PUSH_SCRIPT
+    // The template already has #!/bin/bash on line 1 and HOOK_MARKER on line 2.
+    // We just need to inject the binary path into the SANNAI_BIN= line.
+    POST_PUSH_SCRIPT
         .lines()
         .map(|line| {
             if line.starts_with("SANNAI_BIN=") {
@@ -190,22 +188,22 @@ fn generate_pre_push_script(sannai_bin: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    format!("{}\n{}\n", HOOK_MARKER, script)
+        .join("\n")
 }
 
 fn install_link_commit(paths: &HookPaths) -> Result<()> {
     if let Some(parent) = paths.link_commit.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let script = format!("{}\n{}", HOOK_MARKER, LINK_COMMIT_SCRIPT);
+    // Insert the marker after the shebang line so #!/bin/bash stays on line 1
+    let script = insert_marker_after_shebang(LINK_COMMIT_SCRIPT);
     std::fs::write(&paths.link_commit, &script)?;
     set_executable(&paths.link_commit)?;
     Ok(())
 }
 
 fn install_claude_settings(paths: &HookPaths) -> Result<()> {
-    let hook_command = ".sannai/hooks/link-commit.sh";
+    let hook_command = "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh";
 
     let existing = std::fs::read_to_string(&paths.claude_settings).ok();
     let updated = merge_claude_settings(existing.as_deref(), hook_command)?;
@@ -270,7 +268,7 @@ fn has_sannai_hook_in_array(arr: &[serde_json::Value]) -> bool {
                 hooks.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|c| c.contains("link-commit") || c.contains("sannai"))
+                        .map(is_sannai_command)
                         .unwrap_or(false)
                 })
             })
@@ -281,9 +279,6 @@ fn has_sannai_hook_in_array(arr: &[serde_json::Value]) -> bool {
 // --- Uninstall ---
 
 pub fn uninstall_hooks(repo_root: &Path) -> Result<()> {
-    if !repo_root.join(".git").exists() {
-        bail!("Not a git repository: {}", repo_root.display());
-    }
     let paths = HookPaths::new(repo_root);
     uninstall_hooks_from(&paths)
 }
@@ -349,7 +344,7 @@ fn remove_from_claude_settings(paths: &HookPaths) -> Result<bool> {
                         hooks.iter().any(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
-                                .map(|c| c.contains("link-commit") || c.contains("sannai"))
+                                .map(is_sannai_command)
                                 .unwrap_or(false)
                         })
                     })
@@ -389,9 +384,6 @@ fn remove_from_claude_settings(paths: &HookPaths) -> Result<bool> {
 // --- Print ---
 
 pub fn print_hook_status(repo_root: &Path) -> Result<()> {
-    if !repo_root.join(".git").exists() {
-        bail!("Not a git repository: {}", repo_root.display());
-    }
     let paths = HookPaths::new(repo_root);
     let status = hook_status_at(&paths);
 
@@ -424,6 +416,24 @@ pub fn print_hook_status(repo_root: &Path) -> Result<()> {
 
 use serde::Serialize;
 
+/// Insert the HOOK_MARKER after the shebang line so #!/bin/bash stays on line 1.
+fn insert_marker_after_shebang(script: &str) -> String {
+    let mut lines: Vec<&str> = script.lines().collect();
+    if lines.first().map(|l| l.starts_with("#!")).unwrap_or(false) {
+        lines.insert(1, HOOK_MARKER);
+    } else {
+        lines.insert(0, HOOK_MARKER);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Check if a command string references sannai hooks.
+fn is_sannai_command(cmd: &str) -> bool {
+    cmd.contains("link-commit") || cmd.contains("sannai")
+}
+
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -453,7 +463,17 @@ mod tests {
         let script = generate_pre_push_script("/usr/local/bin/sannai");
         assert!(script.contains(HOOK_MARKER));
         assert!(script.contains("/usr/local/bin/sannai"));
-        assert!(!script.contains("__SANNAI_BIN__"));
+        // Shebang must be on line 1
+        assert!(script.starts_with("#!/bin/bash\n"));
+    }
+
+    #[test]
+    fn test_link_commit_shebang_on_line_1() {
+        let script = insert_marker_after_shebang(LINK_COMMIT_SCRIPT);
+        assert!(script.starts_with("#!/bin/bash\n"));
+        // Marker must be on line 2
+        let lines: Vec<&str> = script.lines().collect();
+        assert_eq!(lines[1], HOOK_MARKER);
     }
 
     #[test]
@@ -529,7 +549,9 @@ mod tests {
 
     #[test]
     fn test_merge_claude_settings_empty() {
-        let result = merge_claude_settings(None, ".sannai/hooks/link-commit.sh").unwrap();
+        let result =
+            merge_claude_settings(None, "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh")
+                .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         let hooks = &parsed["hooks"]["PostToolUse"];
@@ -548,7 +570,11 @@ mod tests {
   }
 }"#;
 
-        let result = merge_claude_settings(Some(existing), ".sannai/hooks/link-commit.sh").unwrap();
+        let result = merge_claude_settings(
+            Some(existing),
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         // Existing hook preserved
@@ -565,7 +591,11 @@ mod tests {
   }
 }"#;
 
-        let result = merge_claude_settings(Some(existing), ".sannai/hooks/link-commit.sh").unwrap();
+        let result = merge_claude_settings(
+            Some(existing),
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         let ptu = parsed["hooks"]["PostToolUse"].as_array().unwrap();
@@ -574,9 +604,14 @@ mod tests {
 
     #[test]
     fn test_merge_claude_settings_idempotent() {
-        let result1 = merge_claude_settings(None, ".sannai/hooks/link-commit.sh").unwrap();
-        let result2 =
-            merge_claude_settings(Some(&result1), ".sannai/hooks/link-commit.sh").unwrap();
+        let result1 =
+            merge_claude_settings(None, "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh")
+                .unwrap();
+        let result2 = merge_claude_settings(
+            Some(&result1),
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
+        )
+        .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result2).unwrap();
         let ptu = parsed["hooks"]["PostToolUse"].as_array().unwrap();
@@ -668,7 +703,7 @@ mod tests {
   "hooks": {
     "PostToolUse": [
       {"matcher": "Write", "hooks": [{"type": "command", "command": "echo write"}]},
-      {"matcher": "Bash", "hooks": [{"type": "command", "command": ".sannai/hooks/link-commit.sh"}]}
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh"}]}
     ],
     "SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "echo hi"}]}]
   }

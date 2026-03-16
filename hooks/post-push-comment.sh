@@ -1,22 +1,14 @@
-# SANNAI-MANAGED-HOOK
-# SANNAI-MANAGED-HOOK
 #!/bin/bash
+# SANNAI-MANAGED-HOOK
 # Sannai post-push hook — auto-posts provenance comments on open PRs.
 #
 # This is a git pre-push hook that fires sannai comment in the background
 # AFTER the push completes. It detects if an open PR exists for the branch
 # being pushed and runs `sannai comment` with LLM summary generation.
 #
-# Install (symlink into any repo):
-#   ln -sf /Users/ashortt/dev/sannai/hooks/post-push-comment.sh .git/hooks/pre-push
-#
-# Or install globally:
-#   git config --global core.hooksPath /Users/ashortt/dev/sannai/hooks/global
-#
-# The hook reads stdin for push refs (standard git pre-push protocol),
-# lets the push proceed, then backgrounds the comment job.
+# Install via: sannai hook install
 
-SANNAI_BIN="${SANNAI_BIN:-/Users/ashortt/dev/sannai/agent/target/debug/sannai}"
+SANNAI_BIN="${SANNAI_BIN:-sannai}"
 SANNAI_LOG="${SANNAI_LOG:-/tmp/sannai-post-push.log}"
 
 # pre-push receives: <remote-name> <remote-url>

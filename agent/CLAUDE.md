@@ -6,7 +6,7 @@ Local daemon that captures Claude Code sessions and posts provenance comments on
 
 ```bash
 cargo build
-cargo test                        # All 97 tests
+cargo test                        # All 98 tests
 cargo test test_parse_user        # Single test by name
 cargo clippy -- -D warnings       # Lint (CI treats warnings as errors)
 cargo fmt                         # Format (max_width=100, see rustfmt.toml)
