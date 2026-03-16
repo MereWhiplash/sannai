@@ -15,6 +15,9 @@ Sannai runs as a local daemon that:
 - **Links** git commits to the sessions that produced them
 - **Comments** on pull requests with session provenance summaries
 
+<img width="1041" height="710" alt="image" src="https://github.com/user-attachments/assets/4dfc3b6c-6c86-468d-8014-160e9cb5ac2f" />
+
+
 ## Quick start
 
 ```bash
