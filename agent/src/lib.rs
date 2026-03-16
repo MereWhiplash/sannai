@@ -2,6 +2,7 @@ pub mod api;
 pub mod comment;
 pub mod config;
 pub mod daemon;
+pub mod hook;
 pub mod parser;
 pub mod provenance;
 pub mod service;
