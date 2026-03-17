@@ -219,6 +219,7 @@ pub fn generate_summary(bundle: &ProvenanceBundle, config: &SummaryConfig) -> Op
             }
         }
         Err(e) => {
+            eprintln!("Warning: LLM summary generation failed: {}", e);
             tracing::warn!("LLM summary generation failed: {}", e);
             None
         }
