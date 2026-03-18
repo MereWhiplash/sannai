@@ -6,7 +6,7 @@ Local daemon that captures Claude Code sessions and posts provenance comments on
 
 ```bash
 cargo build
-cargo test                        # All 98 tests
+cargo test                        # All 104 tests
 cargo test test_parse_user        # Single test by name
 cargo clippy -- -D warnings       # Lint (CI treats warnings as errors)
 cargo fmt                         # Format (max_width=100, see rustfmt.toml)
@@ -14,6 +14,7 @@ cargo run -- start                # Run daemon in foreground
 cargo run -- status               # Check if daemon is running
 cargo run -- sessions             # List captured sessions
 cargo run -- comment --pr <url>   # Post provenance comment on a PR
+cargo run -- compact              # Prune old data, shrink oversized events, VACUUM
 cargo run -- install              # Register as system service
 cargo run -- uninstall [--purge]  # Remove service (and optionally data)
 cargo run -- hook install         # Install git + Claude Code hooks in cwd
@@ -23,11 +24,12 @@ cargo run -- hook uninstall       # Remove sannai hooks from cwd
 
 ## Architecture
 
-The daemon runs three concurrent tokio tasks connected by channels:
+The daemon runs four concurrent tokio tasks connected by channels:
 
-1. **watcher** — Uses `notify` to watch `~/.claude/projects/` for JSONL files. Tails files from saved byte offsets (persisted in `watcher_state.json`). Sends `WatcherEvent` over an mpsc channel.
-2. **session** — `SessionManager` receives `WatcherEvent`s, maintains in-memory `ActiveSession` map, persists to SQLite via `Store`. Ends sessions after 10min idle timeout.
-3. **api** — Axum HTTP server on `127.0.0.1:9847`. Read-only endpoints plus a `POST /hook/commit` for linking commits to active sessions.
+1. **watcher** — Uses `notify` to watch `~/.claude/projects/` for JSONL files. Tails files from saved byte offsets (persisted in `watcher_state.json`). Only registers files with unread data at startup; marks files idle after 2min of inactivity and skips polling them. Sends `WatcherEvent` over an mpsc channel.
+2. **session** — `SessionManager` receives `WatcherEvent`s, maintains in-memory `ActiveSession` map, persists to SQLite via `Store`. Ends sessions after 10min idle timeout. Caps tool_result content at 2KB and strips non-essential tool_use input at storage time.
+3. **api** — Axum HTTP server on `127.0.0.1:9847`. Read-only endpoints plus `POST /hook/commit` for linking commits and `POST /hook/push` for recording pushes.
+4. **sweep** — Periodic background task. Every 60s checks recorded pushes for open PRs and posts comments. Every 6h runs retention (prune sessions >14d, shrink oversized events, slim tool_use metadata). Daily VACUUM to reclaim disk space.
 
 Shared state: `Store` and `SessionManager` are wrapped in `Arc<Mutex<_>>` and passed to all tasks.
 
@@ -37,14 +39,15 @@ Shared state: `Store` and `SessionManager` are wrapped in `Arc<Mutex<_>>` and pa
 watcher -> parser -> session -> store
                                   ^
                             api --+
+                            sweep (PR sweep + retention)
                             comment (PR posting, uses provenance/)
 ```
 
 ### Core pipeline
 - **parser** — `parse_line()` converts a JSONL line into `Vec<ParsedEvent>`. One line can produce multiple events (e.g., assistant message with text + tool_use). Handles: `queue-operation`, `user`, `assistant`. Ignores: `progress`, `system`.
-- **watcher** — `FileWatcher` classifies paths as `MainSession` or `Subagent` based on directory depth. Persists file byte offsets for resume after restart.
-- **session** — `SessionManager.ensure_session()` creates or updates sessions. `process_event()` maps `ParsedEvent` variants to store operations. Stores tool_id/input on tool_use events and content on tool_result events for provenance.
-- **store** — SQLite with WAL mode. Tables: `sessions`, `events`, `commit_links`. All timestamps stored as RFC 3339 strings. Uses `upsert` (INSERT ... ON CONFLICT) for sessions.
+- **watcher** — `FileWatcher` classifies paths as `MainSession` or `Subagent` based on directory depth. Persists file byte offsets for resume after restart. Skips fully-read files at startup; idle files (2min no activity) are excluded from polling and only wake on kernel notify events.
+- **session** — `SessionManager.ensure_session()` creates or updates sessions. `process_event()` maps `ParsedEvent` variants to store operations. Stores tool_id/input on tool_use events (slimmed: Write/Edit input capped at 8KB, Read keeps file_path only, others stripped) and tool_result content capped at 2KB.
+- **store** — SQLite with WAL mode. Tables: `sessions`, `events`, `commit_links`, `pending_comments`. All timestamps stored as RFC 3339 strings. Uses `upsert` (INSERT ... ON CONFLICT) for sessions.
 - **daemon** — PID file management, data dir paths, signal handling. Override dirs with `SANNAI_DATA_DIR` and `SANNAI_CLAUDE_DIR` env vars.
 
 ### Provenance & commenting
@@ -56,7 +59,16 @@ watcher -> parser -> session -> store
 - **comment/github** — `gh` CLI wrapper for fetching PR data and posting/updating comments.
 - **config** — Loads `~/.config/sannai/config.toml` for summary settings.
 - **service** — Cross-platform daemon installer (launchd on macOS, systemd on Linux).
-- **hook** — Manages git pre-push hooks (auto PR comments) and Claude Code PostToolUse hooks (commit linking). Embeds hook scripts via `include_str!`, injects binary path at install time. Merges into existing `.claude/settings.json` without clobbering.
+- **hook** — Manages git pre-push hooks (auto PR comments), Claude Code PostToolUse hooks (commit linking + PR creation detection). Embeds hook scripts via `include_str!`, injects binary path at install time. Merges into existing `.claude/settings.json` without clobbering.
+- **sweep** — Periodic sweep: checks `pending_comments` table for pushes that now have open PRs and posts comments. Runs retention (prune, shrink, slim, VACUUM) on schedule.
+
+## PR Comment Triggers
+
+Sannai posts provenance comments via three complementary mechanisms:
+
+1. **Pre-push hook** — fires on `git push`, checks for open PR, comments immediately. Also records the push via `POST /hook/push` for the sweep.
+2. **PostToolUse hook** — fires in Claude Code after `gh pr create`, extracts PR URL from output, comments immediately.
+3. **Daemon sweep** — every 60s checks recorded pushes for open PRs that haven't been commented on. Catches PRs created outside Claude Code or after the push.
 
 ## API Endpoints (local, :9847)
 
@@ -65,6 +77,13 @@ watcher -> parser -> session -> store
 - `GET /sessions/{id}` — session detail
 - `GET /sessions/{id}/events` — all events for a session
 - `POST /hook/commit` — link a git commit SHA to active sessions (`{"sha": "...", "repo": "..."}`)
+- `POST /hook/push` — record a push for the PR sweep (`{"branch": "...", "owner_repo": "...", "repo_path": "..."}`)
+
+## Resource Footprint
+
+- ~15MB physical memory (2.4MB heap, rest is shared libraries/runtime)
+- Near-zero CPU when idle (no polling of inactive files)
+- ~80MB SQLite DB for 14 days of heavy multi-project use, auto-compacted
 
 ## Conventions
 

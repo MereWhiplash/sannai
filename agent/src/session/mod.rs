@@ -154,9 +154,14 @@ impl SessionManager {
             ParsedEvent::ToolUse { session_id, timestamp, tool_name, tool_id, input, .. } => {
                 self.ensure_session(session_id, *timestamp, &project_dir, None, None).await?;
 
+                // Only store input for tools that attribution/lineage need.
+                // Write/Edit: full input (file_path + content) capped at 8KB.
+                // Read: just file_path. Others: stripped entirely.
+                let stored_input = slim_tool_input(tool_name, input);
+
                 let metadata = serde_json::json!({
                     "tool_id": tool_id,
-                    "input": input,
+                    "input": stored_input,
                 });
 
                 self.persist_event(
@@ -188,10 +193,13 @@ impl SessionManager {
                     "is_error": is_error,
                 });
 
+                // Cap tool_result content — provenance only needs a snippet
+                // (lineage uses first 200 chars). Keep 2KB for some headroom.
+                let capped = content.as_deref().map(|s| truncate_content(s, 2048));
                 self.persist_event(
                     session_id,
                     "tool_result",
-                    content.as_deref(),
+                    capped.as_deref(),
                     *timestamp,
                     Some(metadata),
                 )
@@ -361,6 +369,63 @@ impl SessionManager {
             .map(|s| s.id.clone())
             .collect()
     }
+}
+
+/// Slim down tool_use input to only what provenance needs.
+/// - Write/Edit: keep full input, cap string values at 8KB
+/// - Read: keep only file_path
+/// - Everything else: empty object (tool name is stored in content field)
+fn slim_tool_input(tool_name: &str, input: &serde_json::Value) -> serde_json::Value {
+    const INPUT_CAP: usize = 8192;
+
+    let name = tool_name.to_lowercase();
+    match name.as_str() {
+        "write" | "write_file" | "edit" | "str_replace" | "str_replace_editor" => {
+            // Keep the full object but cap individual string values
+            if let Some(obj) = input.as_object() {
+                let mut slimmed = serde_json::Map::new();
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        if s.len() > INPUT_CAP {
+                            slimmed.insert(
+                                k.clone(),
+                                serde_json::Value::String(truncate_content(s, INPUT_CAP)),
+                            );
+                        } else {
+                            slimmed.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        slimmed.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::Value::Object(slimmed)
+            } else {
+                input.clone()
+            }
+        }
+        "read" | "read_file" => {
+            // Lineage needs file_path only
+            let mut obj = serde_json::Map::new();
+            if let Some(fp) = input.get("file_path").or_else(|| input.get("path")) {
+                obj.insert("file_path".to_string(), fp.clone());
+            }
+            serde_json::Value::Object(obj)
+        }
+        _ => serde_json::json!({}),
+    }
+}
+
+/// Truncate a string to at most `max_bytes` bytes on a char boundary.
+fn truncate_content(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    // Find the last valid char boundary at or before max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &s[..end])
 }
 
 #[cfg(test)]

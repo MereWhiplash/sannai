@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/hook/commit", post(hook_commit))
+        .route("/hook/push", post(hook_push))
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/events", get(get_session_events))
@@ -129,6 +130,30 @@ async fn hook_commit(
     );
 
     Ok(Json(CommitHookResponse { linked_sessions: linked }))
+}
+
+// --- POST /hook/push ---
+
+#[derive(Deserialize)]
+struct PushHookRequest {
+    branch: String,
+    owner_repo: String,
+    repo_path: String,
+}
+
+async fn hook_push(
+    State(state): State<AppState>,
+    Json(req): Json<PushHookRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let store = state.store.lock().await;
+    store.record_push(&req.branch, &req.owner_repo, &req.repo_path).map_err(|e| {
+        tracing::warn!("Failed to record push: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tracing::info!("Recorded push: branch={} repo={}", req.branch, req.owner_repo,);
+
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 // --- GET /sessions ---

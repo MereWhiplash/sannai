@@ -70,6 +70,14 @@ pub struct CommitLink {
     pub linked_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingComment {
+    pub branch: String,
+    pub owner_repo: String,
+    pub repo_path: String,
+    pub pushed_at: DateTime<Utc>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -92,6 +100,18 @@ impl Store {
 
         // Migration v2: add git_branch column
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN git_branch TEXT", []);
+
+        // Migration v3: pending_comments table for PR sweep
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_comments (
+                branch TEXT NOT NULL,
+                owner_repo TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                pushed_at TEXT NOT NULL,
+                PRIMARY KEY (branch, owner_repo)
+            );",
+        )
+        .context("Failed to create pending_comments table")?;
 
         Ok(Self { conn })
     }
@@ -296,6 +316,172 @@ impl Store {
         Ok(sessions)
     }
 
+    // --- Pending comments (PR sweep) ---
+
+    pub fn record_push(&self, branch: &str, owner_repo: &str, repo_path: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_comments (branch, owner_repo, repo_path, pushed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(branch, owner_repo) DO UPDATE SET
+                repo_path = excluded.repo_path,
+                pushed_at = excluded.pushed_at",
+            params![branch, owner_repo, repo_path, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pending_pushes(&self, max_age_hours: i64) -> Result<Vec<PendingComment>> {
+        let cutoff = (Utc::now() - chrono::Duration::hours(max_age_hours)).to_rfc3339();
+        let mut stmt = self.conn.prepare(
+            "SELECT branch, owner_repo, repo_path, pushed_at
+             FROM pending_comments WHERE pushed_at > ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |row| {
+            Ok(PendingComment {
+                branch: row.get(0)?,
+                owner_repo: row.get(1)?,
+                repo_path: row.get(2)?,
+                pushed_at: parse_datetime(row.get::<_, String>(3)?),
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn remove_pending_push(&self, branch: &str, owner_repo: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_comments WHERE branch = ?1 AND owner_repo = ?2",
+            params![branch, owner_repo],
+        )?;
+        Ok(())
+    }
+
+    pub fn cleanup_old_pending_pushes(&self, max_age_hours: i64) -> Result<u64> {
+        let cutoff = (Utc::now() - chrono::Duration::hours(max_age_hours)).to_rfc3339();
+        let count = self
+            .conn
+            .execute("DELETE FROM pending_comments WHERE pushed_at <= ?1", params![cutoff])?;
+        Ok(count as u64)
+    }
+
+    // --- Retention ---
+
+    /// Delete sessions older than `max_age_days` that have ended, along with their events
+    /// and commit links. Returns the number of sessions deleted.
+    pub fn prune_old_sessions(&self, max_age_days: i64) -> Result<u64> {
+        let cutoff = (Utc::now() - chrono::Duration::days(max_age_days)).to_rfc3339();
+
+        // Get IDs of sessions to prune (ended and older than cutoff)
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM sessions
+             WHERE ended_at IS NOT NULL AND ended_at < ?1",
+        )?;
+        let ids: Vec<String> =
+            stmt.query_map(params![cutoff], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Delete events, commit_links, then sessions
+        for id in &ids {
+            self.conn.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM commit_links WHERE session_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        }
+
+        Ok(ids.len() as u64)
+    }
+
+    /// Truncate oversized tool_result content in existing events.
+    /// Returns the number of events updated.
+    pub fn shrink_large_events(&self, max_content_bytes: usize) -> Result<u64> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content FROM events
+             WHERE event_type = 'tool_result'
+               AND LENGTH(content) > ?1
+               AND content NOT LIKE '%…[truncated]'",
+        )?;
+
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![max_content_bytes], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let count = rows.len() as u64;
+        for (id, content) in &rows {
+            let mut end = max_content_bytes;
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            let truncated = format!("{}…[truncated]", &content[..end]);
+            self.conn
+                .execute("UPDATE events SET content = ?1 WHERE id = ?2", params![truncated, id])?;
+        }
+
+        Ok(count)
+    }
+
+    /// Strip non-essential tool_use input from existing events.
+    /// Keeps Write/Edit input (capped), Read file_path only, strips everything else.
+    /// Returns the number of events updated.
+    pub fn slim_tool_use_metadata(&self, input_cap: usize) -> Result<u64> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content, metadata FROM events WHERE event_type = 'tool_use' AND metadata IS NOT NULL",
+        )?;
+
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut updated = 0u64;
+        for (id, tool_name, meta_str) in &rows {
+            let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(meta_str) else {
+                continue;
+            };
+            let Some(input) = meta.get("input") else {
+                continue;
+            };
+            if input.is_null() || (input.is_object() && input.as_object().unwrap().is_empty()) {
+                continue;
+            }
+
+            let slimmed = slim_tool_input_static(tool_name, input, input_cap);
+            let input_str = serde_json::to_string(input).unwrap_or_default();
+            let slimmed_str = serde_json::to_string(&slimmed).unwrap_or_default();
+
+            // Only update if we actually reduced size
+            if slimmed_str.len() < input_str.len() {
+                meta.as_object_mut().unwrap().insert("input".to_string(), slimmed);
+                let new_meta = serde_json::to_string(&meta)?;
+                self.conn.execute(
+                    "UPDATE events SET metadata = ?1 WHERE id = ?2",
+                    params![new_meta, id],
+                )?;
+                updated += 1;
+            }
+        }
+
+        Ok(updated)
+    }
+
+    /// Run VACUUM to reclaim disk space after deletions/updates.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
+        Ok(())
+    }
+
+    /// Returns total database size in bytes (approximate).
+    pub fn db_size_bytes(&self) -> Result<u64> {
+        let page_count: i64 = self.conn.query_row("PRAGMA page_count;", [], |row| row.get(0))?;
+        let page_size: i64 = self.conn.query_row("PRAGMA page_size;", [], |row| row.get(0))?;
+        Ok((page_count * page_size) as u64)
+    }
+
     pub fn get_active_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, tool, project_path, git_branch, started_at, ended_at, synced_at, metadata
@@ -322,6 +508,51 @@ impl Store {
             sessions.push(row?);
         }
         Ok(sessions)
+    }
+}
+
+/// Slim down tool_use input — store-level version for retroactive compaction.
+fn slim_tool_input_static(
+    tool_name: &str,
+    input: &serde_json::Value,
+    input_cap: usize,
+) -> serde_json::Value {
+    let name = tool_name.to_lowercase();
+    match name.as_str() {
+        "write" | "write_file" | "edit" | "str_replace" | "str_replace_editor" => {
+            if let Some(obj) = input.as_object() {
+                let mut slimmed = serde_json::Map::new();
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        if s.len() > input_cap {
+                            let mut end = input_cap;
+                            while end > 0 && !s.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            slimmed.insert(
+                                k.clone(),
+                                serde_json::Value::String(format!("{}…[truncated]", &s[..end])),
+                            );
+                        } else {
+                            slimmed.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        slimmed.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::Value::Object(slimmed)
+            } else {
+                input.clone()
+            }
+        }
+        "read" | "read_file" => {
+            let mut obj = serde_json::Map::new();
+            if let Some(fp) = input.get("file_path").or_else(|| input.get("path")) {
+                obj.insert("file_path".to_string(), fp.clone());
+            }
+            serde_json::Value::Object(obj)
+        }
+        _ => serde_json::json!({}),
     }
 }
 
@@ -579,6 +810,60 @@ mod tests {
         let (store, _dir) = test_store();
         let result = store.get_session("nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_record_and_get_pending_pushes() {
+        let (store, _dir) = test_store();
+
+        store.record_push("feat/foo", "owner/repo", "/path/to/repo").unwrap();
+        store.record_push("fix/bar", "owner/repo", "/path/to/repo").unwrap();
+
+        let pending = store.get_pending_pushes(24).unwrap();
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn test_record_push_upserts() {
+        let (store, _dir) = test_store();
+
+        store.record_push("feat/foo", "owner/repo", "/old/path").unwrap();
+        store.record_push("feat/foo", "owner/repo", "/new/path").unwrap();
+
+        let pending = store.get_pending_pushes(24).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].repo_path, "/new/path");
+    }
+
+    #[test]
+    fn test_remove_pending_push() {
+        let (store, _dir) = test_store();
+
+        store.record_push("feat/foo", "owner/repo", "/path").unwrap();
+        store.record_push("fix/bar", "owner/repo", "/path").unwrap();
+
+        store.remove_pending_push("feat/foo", "owner/repo").unwrap();
+
+        let pending = store.get_pending_pushes(24).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].branch, "fix/bar");
+    }
+
+    #[test]
+    fn test_cleanup_old_pending_pushes() {
+        let (store, _dir) = test_store();
+
+        store.record_push("feat/foo", "owner/repo", "/path").unwrap();
+
+        // Cleanup with 24h max age shouldn't remove fresh entries
+        let cleaned = store.cleanup_old_pending_pushes(24).unwrap();
+        assert_eq!(cleaned, 0);
+        assert_eq!(store.get_pending_pushes(24).unwrap().len(), 1);
+
+        // Cleanup with 0h max age should remove everything
+        let cleaned = store.cleanup_old_pending_pushes(0).unwrap();
+        assert_eq!(cleaned, 1);
+        assert_eq!(store.get_pending_pushes(24).unwrap().len(), 0);
     }
 
     #[test]

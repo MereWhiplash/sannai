@@ -36,6 +36,10 @@ struct TailedFile {
     path: PathBuf,
     offset: u64,
     class: FileClass,
+    /// Set to true when the file hasn't changed for a while, so we skip polling it.
+    idle: bool,
+    /// Timestamp of the last time new data was read from this file.
+    last_activity: std::time::Instant,
 }
 
 /// Persistent state for resuming after restart.
@@ -110,7 +114,8 @@ impl FileWatcher {
         // Bridge sync notify events to our async loop
         let cancel_clone = cancel.clone();
         let mut last_poll = std::time::Instant::now();
-        let poll_interval = std::time::Duration::from_secs(1);
+        let poll_interval = std::time::Duration::from_secs(5);
+        let idle_threshold = std::time::Duration::from_secs(120);
 
         loop {
             if cancel_clone.is_cancelled() {
@@ -140,11 +145,27 @@ impl FileWatcher {
                 }
             }
 
-            // Periodically re-tail all tracked files to catch any missed notify events
-            // (macOS FSEvents can coalesce or miss rapid appends)
+            // Periodically re-tail only active (non-idle) files to catch missed notify events.
+            // Files that haven't produced events in 2 minutes are marked idle and skipped —
+            // they'll wake up if notify delivers an event for them.
             if last_poll.elapsed() >= poll_interval && !self.tailed_files.is_empty() {
-                let paths: Vec<PathBuf> = self.tailed_files.keys().cloned().collect();
-                for path in paths {
+                // Mark files as idle if inactive for long enough
+                let now = std::time::Instant::now();
+                for tailed in self.tailed_files.values_mut() {
+                    if !tailed.idle && now.duration_since(tailed.last_activity) > idle_threshold {
+                        tailed.idle = true;
+                    }
+                }
+
+                // Only poll non-idle files
+                let active_paths: Vec<PathBuf> = self
+                    .tailed_files
+                    .iter()
+                    .filter(|(_, t)| !t.idle)
+                    .map(|(p, _)| p.clone())
+                    .collect();
+
+                for path in active_paths {
                     if let Err(e) = self.tail_file(&path) {
                         tracing::warn!("Failed to poll-tail {}: {}", path.display(), e);
                     }
@@ -185,6 +206,12 @@ impl FileWatcher {
                         let key = file_path.to_string_lossy().to_string();
                         let offset = saved.file_offsets.get(&key).copied().unwrap_or(0);
 
+                        // Skip fully-read files — notify will catch new writes
+                        let file_len = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                        if offset > 0 && offset >= file_len {
+                            continue;
+                        }
+
                         self.register_file(
                             file_path,
                             FileClass::MainSession { session_id, project_dir: project_dir.clone() },
@@ -214,6 +241,13 @@ impl FileWatcher {
 
                                 let key = sub_path.to_string_lossy().to_string();
                                 let offset = saved.file_offsets.get(&key).copied().unwrap_or(0);
+
+                                // Skip fully-read files
+                                let file_len =
+                                    fs::metadata(&sub_path).map(|m| m.len()).unwrap_or(0);
+                                if offset > 0 && offset >= file_len {
+                                    continue;
+                                }
 
                                 self.register_file(
                                     sub_path,
@@ -248,7 +282,16 @@ impl FileWatcher {
             return;
         }
         tracing::debug!("Tracking file: {} (offset={})", path.display(), offset);
-        self.tailed_files.insert(path.clone(), TailedFile { path, offset, class });
+        self.tailed_files.insert(
+            path.clone(),
+            TailedFile {
+                path,
+                offset,
+                class,
+                idle: false,
+                last_activity: std::time::Instant::now(),
+            },
+        );
     }
 
     async fn handle_notify_event(&mut self, event: Event) {
@@ -264,6 +307,11 @@ impl FileWatcher {
                         if let Some(class) = self.classify_path(path) {
                             self.register_file(path.clone(), class, 0);
                         }
+                    }
+
+                    // Wake from idle on notify event
+                    if let Some(tailed) = self.tailed_files.get_mut(path) {
+                        tailed.idle = false;
                     }
 
                     // Tail the file
@@ -360,6 +408,12 @@ impl FileWatcher {
             events_sent
         );
         tailed.offset = bytes_read;
+
+        if events_sent > 0 {
+            tailed.last_activity = std::time::Instant::now();
+            tailed.idle = false;
+        }
+
         Ok(())
     }
 
