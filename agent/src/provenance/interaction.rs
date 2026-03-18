@@ -114,7 +114,10 @@ fn is_noise_interaction(prompt: &str) -> bool {
     }
 
     // Internal Claude Code tags
-    if trimmed.starts_with("<command-name>") || trimmed.starts_with("<local-command-caveat>") {
+    if trimmed.starts_with("<command-name>")
+        || trimmed.starts_with("<local-command-caveat>")
+        || trimmed.starts_with("<task-notification>")
+    {
         return true;
     }
 
@@ -408,6 +411,7 @@ mod tests {
         assert!(is_noise_interaction("continue"));
         assert!(is_noise_interaction("<command-name>foo</command-name>"));
         assert!(is_noise_interaction("<local-command-caveat>bar"));
+        assert!(is_noise_interaction("<task-notification>something"));
         assert!(is_noise_interaction(""));
         assert!(is_noise_interaction("  "));
 

@@ -4,7 +4,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use sannai::{api, comment, config, daemon, hook, provenance, service, session, store, watcher};
+use sannai::{
+    api, comment, config, daemon, hook, provenance, service, session, store, sweep, watcher,
+};
 
 #[derive(Parser)]
 #[command(name = "sannai")]
@@ -50,6 +52,12 @@ enum Commands {
         /// Path to the git repository (defaults to current directory)
         #[arg(long)]
         repo: Option<String>,
+    },
+    /// Compact the database: prune old sessions and shrink oversized events
+    Compact {
+        /// Keep sessions newer than this many days (default: 30)
+        #[arg(long, default_value = "30")]
+        keep_days: i64,
     },
     /// Manage git and Claude Code hooks for a repository
     Hook {
@@ -154,6 +162,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Comment { pr, repo } => {
             run_comment(&pr, repo.as_deref())?;
+        }
+        Commands::Compact { keep_days } => {
+            run_compact(keep_days)?;
         }
         Commands::Hook { action } => {
             let repo_path = match &action {
@@ -366,6 +377,56 @@ fn run_comment(pr_url: &str, repo_path: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_compact(keep_days: i64) -> anyhow::Result<()> {
+    let db_path = daemon::data_dir().join("store.db");
+    if !db_path.exists() {
+        println!("No database found.");
+        return Ok(());
+    }
+
+    let size_before = std::fs::metadata(&db_path)?.len();
+    println!("Database: {} ({:.1}MB)", db_path.display(), size_before as f64 / 1_048_576.0);
+
+    let store = store::Store::open(&db_path)?;
+
+    // 1. Shrink oversized tool_result content
+    let shrunk = store.shrink_large_events(2048)?;
+    if shrunk > 0 {
+        println!("Shrunk {} oversized tool_result event(s) to ≤2KB", shrunk);
+    }
+
+    // 2. Slim tool_use metadata (strip non-essential inputs)
+    let slimmed = store.slim_tool_use_metadata(8192)?;
+    if slimmed > 0 {
+        println!("Slimmed {} tool_use event(s) (stripped non-essential input)", slimmed);
+    }
+
+    // 3. Prune old sessions
+    let pruned = store.prune_old_sessions(keep_days)?;
+    if pruned > 0 {
+        println!("Pruned {} session(s) older than {}d", pruned, keep_days);
+    }
+
+    if shrunk == 0 && slimmed == 0 && pruned == 0 {
+        println!("Nothing to compact.");
+        return Ok(());
+    }
+
+    // 3. VACUUM to reclaim disk space
+    println!("Running VACUUM...");
+    store.vacuum()?;
+
+    let size_after = std::fs::metadata(&db_path)?.len();
+    println!(
+        "Done: {:.1}MB → {:.1}MB (saved {:.1}MB)",
+        size_before as f64 / 1_048_576.0,
+        size_after as f64 / 1_048_576.0,
+        size_before.saturating_sub(size_after) as f64 / 1_048_576.0,
+    );
+
+    Ok(())
+}
+
 fn format_duration(dur: chrono::Duration) -> String {
     let total_seconds = dur.num_seconds();
     if total_seconds < 60 {
@@ -442,6 +503,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     let api_cancel = cancel.clone();
     let api_handle = tokio::spawn(async move { api::serve(api_state, api_cancel).await });
 
+    let sweep_cancel = cancel.clone();
+    let sweep_store = store.clone();
+    let sweep_handle = tokio::spawn(async move { sweep::run(sweep_store, sweep_cancel).await });
+
     tracing::info!("sannai daemon started (PID {}, db={})", std::process::id(), db_path.display(),);
 
     // 9. Wait for any task to complete (or cancellation)
@@ -454,6 +519,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
         r = api_handle => {
             if let Err(e) = r? { tracing::error!("API server error: {}", e); }
+        }
+        r = sweep_handle => {
+            if let Err(e) = r? { tracing::error!("Sweep error: {}", e); }
         }
     }
 

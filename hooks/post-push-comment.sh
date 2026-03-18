@@ -6,6 +6,9 @@
 # AFTER the push completes. It detects if an open PR exists for the branch
 # being pushed and runs `sannai comment` with LLM summary generation.
 #
+# Every push is recorded via the sannai API so the daemon can sweep for
+# PRs that are created after the push (closing the push-then-create-PR gap).
+#
 # Install via: sannai hook install
 
 SANNAI_BIN="${SANNAI_BIN:-sannai}"
@@ -37,6 +40,16 @@ while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
         continue
     fi
 
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+
+    # Record the push so the daemon can sweep for PRs created later
+    PUSH_PAYLOAD=$(jq -n --arg b "$BRANCH" --arg or "$OWNER_REPO" --arg rp "$REPO_ROOT" \
+      '{branch: $b, owner_repo: $or, repo_path: $rp}')
+    curl -s -X POST http://127.0.0.1:9847/hook/push \
+      -H "Content-Type: application/json" \
+      -d "$PUSH_PAYLOAD" \
+      > /dev/null 2>&1
+
     # Background: wait for push to complete, then check for PR and comment
     (
         # Small delay to ensure the push has landed on the remote
@@ -46,12 +59,11 @@ while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
         PR_NUMBER=$(gh pr view "$BRANCH" --repo "$OWNER_REPO" --json number --jq '.number' 2>/dev/null)
 
         if [ -z "$PR_NUMBER" ]; then
-            echo "[$(date -Iseconds)] No open PR for branch '$BRANCH' on $OWNER_REPO, skipping" >> "$SANNAI_LOG"
+            echo "[$(date -Iseconds)] No open PR for branch '$BRANCH' on $OWNER_REPO, skipping (recorded for sweep)" >> "$SANNAI_LOG"
             exit 0
         fi
 
         PR_URL="https://github.com/$OWNER_REPO/pull/$PR_NUMBER"
-        REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 
         echo "[$(date -Iseconds)] Posting sannai comment on $PR_URL" >> "$SANNAI_LOG"
 

@@ -5,12 +5,14 @@ const HOOK_MARKER: &str = "# SANNAI-MANAGED-HOOK";
 
 const LINK_COMMIT_SCRIPT: &str = include_str!("../../../hooks/link-commit.sh");
 const POST_PUSH_SCRIPT: &str = include_str!("../../../hooks/post-push-comment.sh");
+const POST_PR_COMMENT_SCRIPT: &str = include_str!("../../../hooks/post-pr-comment.sh");
 
 /// Where hooks live relative to a repo root.
 pub struct HookPaths {
     pub repo_root: PathBuf,
     pub pre_push: PathBuf,
     pub link_commit: PathBuf,
+    pub post_pr_comment: PathBuf,
     pub claude_settings: PathBuf,
 }
 
@@ -20,6 +22,7 @@ impl HookPaths {
             repo_root: repo_root.to_path_buf(),
             pre_push: repo_root.join(".git/hooks/pre-push"),
             link_commit: repo_root.join(".sannai/hooks/link-commit.sh"),
+            post_pr_comment: repo_root.join(".sannai/hooks/post-pr-comment.sh"),
             claude_settings: repo_root.join(".claude/settings.json"),
         }
     }
@@ -35,6 +38,7 @@ pub enum HookState {
 pub struct HookStatusReport {
     pub pre_push: HookState,
     pub link_commit: HookState,
+    pub post_pr_comment: HookState,
     pub claude_settings: bool,
 }
 
@@ -44,6 +48,7 @@ pub fn hook_status_at(paths: &HookPaths) -> HookStatusReport {
     HookStatusReport {
         pre_push: check_hook_state(&paths.pre_push),
         link_commit: check_hook_state(&paths.link_commit),
+        post_pr_comment: check_hook_state(&paths.post_pr_comment),
         claude_settings: check_claude_settings(&paths.claude_settings),
     }
 }
@@ -107,6 +112,7 @@ pub fn install_hooks_to(paths: &HookPaths, sannai_bin: &str, force: bool) -> Res
     println!("Installing sannai hooks into {}...\n", paths.repo_root.display());
 
     let mut ok_count = 0;
+    let total = 4;
 
     // 1. Git pre-push hook
     match install_pre_push(paths, sannai_bin, force) {
@@ -132,7 +138,16 @@ pub fn install_hooks_to(paths: &HookPaths, sannai_bin: &str, force: bool) -> Res
         Err(e) => println!("  [ERR] Commit linker: {}", e),
     }
 
-    // 3. Claude Code settings
+    // 3. PR comment script
+    match install_post_pr_comment(paths, sannai_bin) {
+        Ok(()) => {
+            println!("  [OK] PR comment hook: .sannai/hooks/post-pr-comment.sh");
+            ok_count += 1;
+        }
+        Err(e) => println!("  [ERR] PR comment hook: {}", e),
+    }
+
+    // 4. Claude Code settings
     match install_claude_settings(paths) {
         Ok(()) => {
             println!("  [OK] Claude Code settings: .claude/settings.json");
@@ -142,10 +157,10 @@ pub fn install_hooks_to(paths: &HookPaths, sannai_bin: &str, force: bool) -> Res
     }
 
     println!();
-    if ok_count == 3 {
+    if ok_count == total {
         println!("All hooks installed.");
     } else {
-        println!("{}/3 hooks installed.", ok_count);
+        println!("{}/{} hooks installed.", ok_count, total);
     }
     println!();
     println!("Next steps:");
@@ -202,11 +217,40 @@ fn install_link_commit(paths: &HookPaths) -> Result<()> {
     Ok(())
 }
 
+fn install_post_pr_comment(paths: &HookPaths, sannai_bin: &str) -> Result<()> {
+    if let Some(parent) = paths.post_pr_comment.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let script = generate_post_pr_comment_script(sannai_bin);
+    std::fs::write(&paths.post_pr_comment, &script)?;
+    set_executable(&paths.post_pr_comment)?;
+    Ok(())
+}
+
+fn generate_post_pr_comment_script(sannai_bin: &str) -> String {
+    let marked = insert_marker_after_shebang(POST_PR_COMMENT_SCRIPT);
+    let mut lines: Vec<String> = marked
+        .lines()
+        .map(|line| {
+            if line.starts_with("SANNAI_BIN=") {
+                format!("SANNAI_BIN=\"${{SANNAI_BIN:-{}}}\"", sannai_bin)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    lines.push(String::new()); // trailing newline
+    lines.join("\n")
+}
+
 fn install_claude_settings(paths: &HookPaths) -> Result<()> {
-    let hook_command = "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh";
+    let hook_commands = &[
+        "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
+        "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/post-pr-comment.sh",
+    ];
 
     let existing = std::fs::read_to_string(&paths.claude_settings).ok();
-    let updated = merge_claude_settings(existing.as_deref(), hook_command)?;
+    let updated = merge_claude_settings(existing.as_deref(), hook_commands)?;
 
     if let Some(parent) = paths.claude_settings.parent() {
         std::fs::create_dir_all(parent)?;
@@ -215,7 +259,7 @@ fn install_claude_settings(paths: &HookPaths) -> Result<()> {
     Ok(())
 }
 
-fn merge_claude_settings(existing: Option<&str>, hook_command: &str) -> Result<String> {
+fn merge_claude_settings(existing: Option<&str>, hook_commands: &[&str]) -> Result<String> {
     let mut root: serde_json::Value = match existing {
         Some(s) if !s.trim().is_empty() => {
             serde_json::from_str(s).context("Failed to parse .claude/settings.json")?
@@ -236,31 +280,8 @@ fn merge_claude_settings(existing: Option<&str>, hook_command: &str) -> Result<S
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("PostToolUse is not an array in .claude/settings.json"))?;
 
-    // Check for existing sannai entry
-    let already_present = has_sannai_hook_in_array(arr);
-
-    if !already_present {
-        arr.push(serde_json::json!({
-            "matcher": "Bash",
-            "hooks": [{
-                "type": "command",
-                "command": hook_command,
-                "timeout": 10
-            }]
-        }));
-    }
-
-    let mut buf = Vec::new();
-    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"  ");
-    let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
-    root.serialize(&mut serializer)?;
-    let mut json = String::from_utf8(buf)?;
-    json.push('\n');
-    Ok(json)
-}
-
-fn has_sannai_hook_in_array(arr: &[serde_json::Value]) -> bool {
-    arr.iter().any(|entry| {
+    // Find existing sannai entry or create one
+    let sannai_idx = arr.iter().position(|entry| {
         entry
             .get("hooks")
             .and_then(|h| h.as_array())
@@ -273,7 +294,52 @@ fn has_sannai_hook_in_array(arr: &[serde_json::Value]) -> bool {
                 })
             })
             .unwrap_or(false)
-    })
+    });
+
+    if let Some(idx) = sannai_idx {
+        // Add any missing hook commands to the existing entry
+        let hooks_arr = arr[idx]
+            .get_mut("hooks")
+            .and_then(|h| h.as_array_mut())
+            .ok_or_else(|| anyhow::anyhow!("sannai hooks entry is malformed"))?;
+
+        for cmd in hook_commands {
+            let already =
+                hooks_arr.iter().any(|h| h.get("command").and_then(|c| c.as_str()) == Some(cmd));
+            if !already {
+                hooks_arr.push(serde_json::json!({
+                    "type": "command",
+                    "command": *cmd,
+                    "timeout": 10
+                }));
+            }
+        }
+    } else {
+        // No sannai entry — create one with all commands
+        let hooks_list: Vec<serde_json::Value> = hook_commands
+            .iter()
+            .map(|cmd| {
+                serde_json::json!({
+                    "type": "command",
+                    "command": *cmd,
+                    "timeout": 10
+                })
+            })
+            .collect();
+
+        arr.push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": hooks_list
+        }));
+    }
+
+    let mut buf = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"  ");
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
+    root.serialize(&mut serializer)?;
+    let mut json = String::from_utf8(buf)?;
+    json.push('\n');
+    Ok(json)
 }
 
 // --- Uninstall ---
@@ -302,19 +368,28 @@ pub fn uninstall_hooks_from(paths: &HookPaths) -> Result<()> {
     // 2. Link-commit script
     if paths.link_commit.exists() {
         std::fs::remove_file(&paths.link_commit)?;
-        // Clean up empty dirs
-        if let Some(hooks_dir) = paths.link_commit.parent() {
-            let _ = std::fs::remove_dir(hooks_dir); // only removes if empty
-            if let Some(sannai_dir) = hooks_dir.parent() {
-                let _ = std::fs::remove_dir(sannai_dir);
-            }
-        }
         println!("  [OK] Removed commit linker");
     } else {
         println!("  [--] No commit linker found");
     }
 
-    // 3. Claude settings
+    // 3. PR comment script
+    if paths.post_pr_comment.exists() {
+        std::fs::remove_file(&paths.post_pr_comment)?;
+        println!("  [OK] Removed PR comment hook");
+    } else {
+        println!("  [--] No PR comment hook found");
+    }
+
+    // Clean up empty dirs
+    if let Some(hooks_dir) = paths.link_commit.parent() {
+        let _ = std::fs::remove_dir(hooks_dir); // only removes if empty
+        if let Some(sannai_dir) = hooks_dir.parent() {
+            let _ = std::fs::remove_dir(sannai_dir);
+        }
+    }
+
+    // 4. Claude settings
     match remove_from_claude_settings(paths) {
         Ok(true) => println!("  [OK] Removed sannai entry from Claude Code settings"),
         Ok(false) => println!("  [--] No sannai entry in Claude Code settings"),
@@ -405,6 +480,14 @@ pub fn print_hook_status(repo_root: &Path) -> Result<()> {
         }
     );
     println!(
+        "  PR comment hook:       {}",
+        match status.post_pr_comment {
+            HookState::Installed => "installed",
+            HookState::NotInstalled => "not installed",
+            HookState::ExternalExists => "external script present (not sannai)",
+        }
+    );
+    println!(
         "  Claude Code settings:  {}",
         if status.claude_settings { "configured" } else { "not configured" }
     );
@@ -431,7 +514,7 @@ fn insert_marker_after_shebang(script: &str) -> String {
 
 /// Check if a command string references sannai hooks.
 fn is_sannai_command(cmd: &str) -> bool {
-    cmd.contains("link-commit") || cmd.contains("sannai")
+    cmd.contains("link-commit") || cmd.contains("post-pr-comment") || cmd.contains("sannai")
 }
 
 #[cfg(unix)]
@@ -465,6 +548,28 @@ mod tests {
         assert!(script.contains("/usr/local/bin/sannai"));
         // Shebang must be on line 1
         assert!(script.starts_with("#!/bin/bash\n"));
+    }
+
+    #[test]
+    fn test_generate_post_pr_comment_injects_binary_path() {
+        let script = generate_post_pr_comment_script("/usr/local/bin/sannai");
+        assert!(script.contains(HOOK_MARKER));
+        assert!(script.contains("/usr/local/bin/sannai"));
+        assert!(script.starts_with("#!/bin/bash\n"));
+        assert!(script.contains("gh pr create"));
+    }
+
+    #[test]
+    fn test_install_creates_post_pr_comment() {
+        let dir = setup_fake_repo();
+        let paths = HookPaths::new(dir.path());
+
+        install_post_pr_comment(&paths, "/usr/bin/sannai").unwrap();
+        assert!(paths.post_pr_comment.exists());
+
+        let content = std::fs::read_to_string(&paths.post_pr_comment).unwrap();
+        assert!(content.contains(HOOK_MARKER));
+        assert!(content.contains("/usr/bin/sannai"));
     }
 
     #[test]
@@ -549,17 +654,21 @@ mod tests {
 
     #[test]
     fn test_merge_claude_settings_empty() {
-        let result =
-            merge_claude_settings(None, "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh")
-                .unwrap();
+        let commands = &[
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/post-pr-comment.sh",
+        ];
+        let result = merge_claude_settings(None, commands).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         let hooks = &parsed["hooks"]["PostToolUse"];
         assert!(hooks.is_array());
-        assert_eq!(hooks.as_array().unwrap().len(), 1);
+        assert_eq!(hooks.as_array().unwrap().len(), 1); // single sannai entry
 
-        let cmd = hooks[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("link-commit"));
+        let inner = hooks[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 2); // both hook commands
+        assert!(inner[0]["command"].as_str().unwrap().contains("link-commit"));
+        assert!(inner[1]["command"].as_str().unwrap().contains("post-pr-comment"));
     }
 
     #[test]
@@ -570,11 +679,11 @@ mod tests {
   }
 }"#;
 
-        let result = merge_claude_settings(
-            Some(existing),
+        let commands = &[
             "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
-        )
-        .unwrap();
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/post-pr-comment.sh",
+        ];
+        let result = merge_claude_settings(Some(existing), commands).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         // Existing hook preserved
@@ -591,11 +700,11 @@ mod tests {
   }
 }"#;
 
-        let result = merge_claude_settings(
-            Some(existing),
+        let commands = &[
             "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
-        )
-        .unwrap();
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/post-pr-comment.sh",
+        ];
+        let result = merge_claude_settings(Some(existing), commands).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         let ptu = parsed["hooks"]["PostToolUse"].as_array().unwrap();
@@ -604,18 +713,52 @@ mod tests {
 
     #[test]
     fn test_merge_claude_settings_idempotent() {
-        let result1 =
-            merge_claude_settings(None, "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh")
-                .unwrap();
-        let result2 = merge_claude_settings(
-            Some(&result1),
+        let commands = &[
             "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
-        )
-        .unwrap();
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/post-pr-comment.sh",
+        ];
+        let result1 = merge_claude_settings(None, commands).unwrap();
+        let result2 = merge_claude_settings(Some(&result1), commands).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result2).unwrap();
         let ptu = parsed["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(ptu.len(), 1); // not duplicated
+        let inner = ptu[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 2); // both commands present, not duplicated
+    }
+
+    #[test]
+    fn test_merge_claude_settings_adds_missing_hook_to_existing_sannai_entry() {
+        // Simulate a repo that was installed before post-pr-comment existed
+        let existing = r#"{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+
+        let commands = &[
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/link-commit.sh",
+            "\"$CLAUDE_PROJECT_DIR\"/.sannai/hooks/post-pr-comment.sh",
+        ];
+        let result = merge_claude_settings(Some(existing), commands).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        let ptu = parsed["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(ptu.len(), 1); // still one sannai entry
+        let inner = ptu[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 2); // both commands now
+        assert!(inner[1]["command"].as_str().unwrap().contains("post-pr-comment"));
     }
 
     #[test]
@@ -626,6 +769,7 @@ mod tests {
 
         assert_eq!(status.pre_push, HookState::NotInstalled);
         assert_eq!(status.link_commit, HookState::NotInstalled);
+        assert_eq!(status.post_pr_comment, HookState::NotInstalled);
         assert!(!status.claude_settings);
     }
 
@@ -639,6 +783,7 @@ mod tests {
 
         assert_eq!(status.pre_push, HookState::Installed);
         assert_eq!(status.link_commit, HookState::Installed);
+        assert_eq!(status.post_pr_comment, HookState::Installed);
         assert!(status.claude_settings);
     }
 
@@ -661,10 +806,12 @@ mod tests {
         install_hooks_to(&paths, "/usr/bin/sannai", false).unwrap();
         assert!(paths.pre_push.exists());
         assert!(paths.link_commit.exists());
+        assert!(paths.post_pr_comment.exists());
 
         uninstall_hooks_from(&paths).unwrap();
         assert!(!paths.pre_push.exists());
         assert!(!paths.link_commit.exists());
+        assert!(!paths.post_pr_comment.exists());
     }
 
     #[test]

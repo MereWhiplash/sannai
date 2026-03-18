@@ -68,7 +68,7 @@ pub fn format_comment(data: &CommentData) -> String {
         md.push_str("\n\n");
     }
 
-    // Per-session interaction tables in collapsible sections
+    // Per-session interaction tables: key interactions shown, others collapsed
     for session in &data.sessions {
         let short_id = &session.session_id[..std::cmp::min(8, session.session_id.len())];
         let n = session.interactions.len();
@@ -78,9 +78,24 @@ pub fn format_comment(data: &CommentData) -> String {
             None => String::new(),
         };
 
-        md.push_str("<details>\n");
+        // Partition into key (wrote files or has attribution) and supporting
+        let (key, supporting): (Vec<_>, Vec<_>) =
+            session.interactions.iter().partition(|interaction| {
+                let has_writes = session.lineage.iter().any(|l| {
+                    l.interaction_id == interaction.id
+                        && l.operations.iter().any(|op| {
+                            matches!(op.op_type, FileOpType::Write | FileOpType::ReadWrite)
+                        })
+                });
+                let has_attr = data
+                    .attributions
+                    .iter()
+                    .any(|a| a.interaction_id.as_deref() == Some(&interaction.id));
+                has_writes || has_attr
+            });
+
         md.push_str(&format!(
-            "<summary>Session <code>{}</code> \u{2014} {} interaction{}, {} active{}</summary>\n\n",
+            "### Session `{}` \u{2014} {} interaction{}, {} active{}\n\n",
             short_id,
             n,
             if n != 1 { "s" } else { "" },
@@ -88,20 +103,52 @@ pub fn format_comment(data: &CommentData) -> String {
             wall_note,
         ));
 
-        md.push_str("| # | Prompt | Files | Attribution |\n");
-        md.push_str("|---|--------|-------|-------------|\n");
-
-        for interaction in &session.interactions {
-            let prompt_preview = truncate_for_table(&interaction.prompt, 60);
-            let files = format_files_touched(&session.lineage, &interaction.id);
-            let attr = format_interaction_attribution(&data.attributions, &interaction.id);
-
+        // Key interactions table (always visible)
+        if !key.is_empty() {
             md.push_str(&format!(
-                "| {} | {} | {} | {} |\n",
-                interaction.sequence, prompt_preview, files, attr,
+                "**{} key interaction{}** (wrote files or attributed to diff):\n\n",
+                key.len(),
+                if key.len() != 1 { "s" } else { "" },
             ));
+            md.push_str("| # | Prompt | Files | Attribution |\n");
+            md.push_str("|---|--------|-------|-------------|\n");
+
+            for interaction in &key {
+                let prompt_preview = truncate_for_table(&interaction.prompt, 60);
+                let files = format_files_touched(&session.lineage, &interaction.id);
+                let attr = format_interaction_attribution(&data.attributions, &interaction.id);
+
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    interaction.sequence, prompt_preview, files, attr,
+                ));
+            }
+            md.push('\n');
         }
-        md.push_str("\n</details>\n\n");
+
+        // Supporting interactions collapsed
+        if !supporting.is_empty() {
+            md.push_str("<details>\n");
+            md.push_str(&format!(
+                "<summary>{} supporting interaction{} (investigation, discussion, \
+                 read-only)</summary>\n\n",
+                supporting.len(),
+                if supporting.len() != 1 { "s" } else { "" },
+            ));
+            md.push_str("| # | Prompt | Files |\n");
+            md.push_str("|---|--------|-------|\n");
+
+            for interaction in &supporting {
+                let prompt_preview = truncate_for_table(&interaction.prompt, 60);
+                let files = format_files_touched(&session.lineage, &interaction.id);
+
+                md.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    interaction.sequence, prompt_preview, files,
+                ));
+            }
+            md.push_str("\n</details>\n\n");
+        }
     }
 
     // Diff attribution in collapsible section, aggregated per-file
@@ -322,7 +369,8 @@ mod tests {
         assert!(comment.contains("1 AI session"));
         assert!(comment.contains("abcdef12"));
         assert!(comment.contains("Fix the upload bug"));
-        assert!(comment.contains("<details>"));
+        // No-write interaction goes to supporting section
+        assert!(comment.contains("supporting interaction"));
     }
 
     #[test]
@@ -382,7 +430,7 @@ mod tests {
 
         let comment = format_comment(&data);
         assert!(comment.contains("6m active"));
-        assert!(comment.contains("3h 6m wall"));
+        assert!(comment.contains("3h 6m wall"), "comment was: {}", comment);
     }
 
     #[test]
